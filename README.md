@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 每 30 分钟发现新达标视频，每天深度复扫最近 90 天。
+- 每 1 小时发现新达标视频，每天深度复扫最近 90 天。
 - 按播放量排序扫描，接口达到 1,000 条上限时自动拆分时间窗口。
 - 支持 `agent`、`AI`、`Codex`、`Claude Code`、`ComfyUI`、`Midjourney` 等关键词及别名。
 - 对 `AI`、`MJ`、`SD` 等歧义词使用单词边界和 AI 上下文过滤。
@@ -29,7 +29,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 安装脚本会自动定位当前用户目录下的 Codex Node.js 运行时，并创建三个任务：
 
-- `BVCollector-Incremental`：每 30 分钟增量采集并续跑一批首次回溯。
+- `BVCollector-Incremental`：每 1 小时增量采集并续跑一批首次回溯。
 - `BVCollector-Daily`：每天 03:30 深度复扫。
 - `BVCollector-Weekly`：每周一 09:00 导出上周周报。
 

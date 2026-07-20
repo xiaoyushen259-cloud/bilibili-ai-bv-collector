@@ -46,12 +46,12 @@ function Register-BVTask {
 }
 
 $incrementalTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
-    -RepetitionInterval (New-TimeSpan -Minutes 30) `
+    -RepetitionInterval (New-TimeSpan -Hours 1) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
 $dailyTrigger = New-ScheduledTaskTrigger -Daily -At '03:30'
 $weeklyTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '09:00'
 
-Register-BVTask -TaskName 'BVCollector-Incremental' -TaskArguments @('cycle') -Trigger $incrementalTrigger -Description 'Collect new videos and resume a bounded initial backfill batch every 30 minutes.'
+Register-BVTask -TaskName 'BVCollector-Incremental' -TaskArguments @('cycle') -Trigger $incrementalTrigger -Description 'Collect new videos and resume a bounded initial backfill batch every hour.'
 Register-BVTask -TaskName 'BVCollector-Daily' -TaskArguments @('scan', '--mode', 'full') -Trigger $dailyTrigger -Description 'Rescan the rolling 90-day window every day.'
 Register-BVTask -TaskName 'BVCollector-Weekly' -TaskArguments @('export', '--scope', 'weekly') -Trigger $weeklyTrigger -Description 'Export the previous completed week every Monday.'
 
