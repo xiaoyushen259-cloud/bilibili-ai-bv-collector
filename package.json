@@ -15,6 +15,9 @@
     "scan:full": "node app.mjs scan --mode full",
     "export": "node app.mjs export --scope master",
     "export:weekly": "node app.mjs export --scope weekly",
+    "feishu:preview": "node app.mjs feishu preview",
+    "feishu:doctor": "node app.mjs feishu doctor",
+    "feishu:sync": "node app.mjs feishu sync",
     "test": "node --test"
   }
 }

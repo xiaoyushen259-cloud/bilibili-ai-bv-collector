@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "app_id": "cli_xxxxxxxxxxxxxxxx",
+  "app_secret": "请勿提交真实密钥",
+  "sheet_url": "https://example.feishu.cn/sheets/xxxxxxxxxxxxxxxx?sheet=xxxxxx",
+  "batch_rows": 200,
+  "clear_until_row": 20000
+}

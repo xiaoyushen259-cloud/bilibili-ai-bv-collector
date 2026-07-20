@@ -6,6 +6,7 @@ import { BilibiliClient } from "./src/bilibili.mjs";
 import { CollectorDatabase } from "./src/db.mjs";
 import { evaluateRelevance, flattenKeywordGroups, isWithinWindow, normalizeVideo } from "./src/core.mjs";
 import { exportWorkbook } from "./src/exporter.mjs";
+import { buildFeishuMatrix, FeishuSheetsClient, loadFeishuSettings } from "./src/feishu.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(ROOT, "config.json");
@@ -15,6 +16,7 @@ const OUTPUT_DIR = path.join(ROOT, "output");
 const QA_DIR = path.join(ROOT, "qa");
 const DB_PATH = path.join(DATA_DIR, "collector.sqlite");
 const LOCK_PATH = path.join(DATA_DIR, "collector.lock");
+const FEISHU_CONFIG_PATH = path.join(DATA_DIR, "feishu-config.json");
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
@@ -157,6 +159,10 @@ function buildScanUnits(mode, queries, job, config) {
 
 function jobProgressKind(mode, config) {
   return mode === "full" ? `segment-v2-time-first-${config.fullSegmentHours ?? 24}h` : "query-v1";
+}
+
+export function shouldExportExcelAfterScan(config) {
+  return config.excelExportAfterScan === true;
 }
 
 async function exportScope(db, config, scope, { qa = false } = {}) {
@@ -326,7 +332,9 @@ async function runScan(mode, { qa = false, maxUnits = Number.POSITIVE_INFINITY, 
       db.completeJob(job.id);
     }
     stats.requestCount = client.requestCount;
-    await exportScope(db, config, "master", { qa });
+    if (shouldExportExcelAfterScan(config)) {
+      await exportScope(db, config, "master", { qa });
+    }
     db.finishRun(runId, stats);
     const outcome = completed ? "完成" : `本批暂停，断点 ${nextIndex}/${units.length}，延期 ${deferredCount} 个单元`;
     await log(`${mode} 扫描${outcome}：请求 ${stats.requestCount} 次，新收录 ${stats.insertedCount} 条，更新 ${stats.updatedCount} 次`);
@@ -351,7 +359,65 @@ async function runCycle({ qa = false } = {}) {
     maxUnits: config.backfillUnitsPerCycle ?? 40,
     resumeOnly: true,
   });
-  return { incremental, backfill };
+  const feishu = await syncFeishuIfConfigured();
+  return { incremental, backfill, feishu };
+}
+
+async function qualifiedRowsSnapshot() {
+  const config = await loadConfig();
+  await ensureDirectories();
+  const releaseLock = await acquireLock(config);
+  const db = new CollectorDatabase(DB_PATH);
+  try {
+    return db.listVideos({
+      cutoffTs: nowSeconds() - config.lookbackDays * 86400,
+      minViews: config.minViews,
+    });
+  } finally {
+    db.close();
+    await releaseLock();
+  }
+}
+
+async function runFeishu(action = "preview", { settings: suppliedSettings = null } = {}) {
+  if (action === "preview") {
+    const rows = await qualifiedRowsSnapshot();
+    const matrix = buildFeishuMatrix(rows);
+    const preview = { rowCount: rows.length, headers: matrix[0], firstRows: matrix.slice(1, 6) };
+    console.log(JSON.stringify(preview, null, 2));
+    return preview;
+  }
+
+  const settings = suppliedSettings ?? await loadFeishuSettings(
+    FEISHU_CONFIG_PATH,
+    process.env,
+    { required: true },
+  );
+  const client = new FeishuSheetsClient(settings);
+  if (action === "doctor") {
+    const result = await client.doctor();
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  if (action === "sync") {
+    const rows = await qualifiedRowsSnapshot();
+    const result = await client.sync(rows);
+    await log(`飞书同步完成：${result.rowCount} 条，最新 BV号 ${result.firstBvid ?? "无"}`);
+    console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  throw new Error("feishu 仅支持 preview、doctor 或 sync");
+}
+
+async function syncFeishuIfConfigured() {
+  const settings = await loadFeishuSettings(FEISHU_CONFIG_PATH);
+  if (!settings.enabled) return { skipped: true, reason: "飞书自动同步未启用" };
+  try {
+    return await runFeishu("sync", { settings });
+  } catch (error) {
+    await log(`飞书自动同步失败，采集结果已保留：${error.stack ?? error}`, "ERROR");
+    return { failed: true, error: String(error?.message ?? error) };
+  }
 }
 
 async function runExport(scope, { qa = false } = {}) {
@@ -404,6 +470,7 @@ async function main() {
     return runScan(mode, { qa });
   }
   if (command === "cycle") return runCycle({ qa });
+  if (command === "feishu") return runFeishu(process.argv[3] ?? "preview");
   if (command === "export") {
     const scope = readOption("--scope", "master");
     if (!["master", "weekly"].includes(scope)) throw new Error("--scope 仅支持 master 或 weekly");
@@ -431,8 +498,11 @@ export {
   jobProgressKind,
   lastCompletedWeek,
   makeJobWindow,
+  qualifiedRowsSnapshot,
   runCycle,
   runExport,
+  runFeishu,
   runScan,
+  syncFeishuIfConfigured,
   splitWindowNewestFirst,
 };

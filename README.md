@@ -71,9 +71,36 @@ B站返回 `412` 或 `v_voucher` 时，当前扫描会保留到“关键词 + 7 
 
 配置集中在 `config.json`，可调整关键词、播放量门槛、时间窗口、请求间隔和相关性上下文词。
 
+## 同步到飞书电子表格
+
+飞书同步直接从 SQLite 读取达标视频，再通过飞书开放平台 API 写入目标工作表，不读取或上传本地 Excel。它会按“首次收集时间”倒序覆盖目标工作表，最新收集的视频始终位于表头下方。字段包括 BV号、直链、标题、播放量、发布时间、UP主、分区、关键词、首次收集时间、最近检查时间和相关性依据。
+
+1. 在飞书开放平台创建企业自建应用，开通“查看、评论、编辑和管理电子表格”权限。
+2. 新建一个空白的普通飞书电子表格（链接必须包含 `/sheets/`，不是 `/base/` 多维表格），并把该应用添加为可编辑的文档应用或协作者。
+3. 运行本地配置脚本；App Secret 会隐藏输入并只保存在被 Git 忽略的 `data\feishu-config.json`：
+
+```powershell
+.\scripts\configure-feishu.ps1
+```
+
+本地预览排序结果，不访问飞书：
+
+```powershell
+& $node --no-warnings .\app.mjs feishu preview
+```
+
+检查授权或手动同步：
+
+```powershell
+& $node --no-warnings .\app.mjs feishu doctor
+& $node --no-warnings .\app.mjs feishu sync
+```
+
+当 `enabled` 为 `true` 时，每次 `cycle` 完成后会自动同步一次。飞书同步失败不会删除本地 SQLite 数据。`config.json` 中的 `excelExportAfterScan` 默认关闭，因此自动采集不会生成 Excel 中转文件；Excel 仅在手动执行 `export` 命令时生成。
+
 ## 数据与隐私
 
-仓库不包含本机数据库、运行日志、Excel 结果或 Cookie。采集器仅访问 B站公开搜索接口，并遵守保守的单线程请求间隔；接口异常时保留本地断点。
+仓库不包含本机数据库、运行日志、Excel 结果、飞书密钥或 Cookie。采集器仅访问 B站公开搜索接口，并遵守保守的单线程请求间隔；接口异常时保留本地断点。
 
 ## License
 
