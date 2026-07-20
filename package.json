@@ -1,0 +1,20 @@
+{
+  "name": "bilibili-ai-bv-collector",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "B站 AI 视频 BV号自动采集器",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "doctor": "node app.mjs doctor",
+    "cycle": "node app.mjs cycle",
+    "scan:incremental": "node app.mjs scan --mode incremental",
+    "scan:full": "node app.mjs scan --mode full",
+    "export": "node app.mjs export --scope master",
+    "export:weekly": "node app.mjs export --scope weekly",
+    "test": "node --test"
+  }
+}
