@@ -26,11 +26,6 @@ function excelColumnName(index) {
   return result;
 }
 
-function hyperlinkFormula(url) {
-  const escaped = String(url).replace(/"/g, '""');
-  return `=HYPERLINK("${escaped}","${escaped}")`;
-}
-
 function formatChinaTime(date = new Date()) {
   return new Intl.DateTimeFormat("zh-CN", {
     timeZone: "Asia/Shanghai",
@@ -39,8 +34,10 @@ function formatChinaTime(date = new Date()) {
   }).format(date).replaceAll("/", "-");
 }
 
-function toDate(seconds) {
-  return new Date(Number(seconds) * 1000);
+function toChinaExcelDate(seconds) {
+  // Excel 日期没有时区信息；artifact-tool 按 UTC 组件写入序列值，
+  // 因此先平移到 Asia/Shanghai，确保 Excel/飞书中显示北京时间。
+  return new Date((Number(seconds) + 8 * 3600) * 1000);
 }
 
 function styleTitle(sheet, rangeAddress) {
@@ -86,21 +83,16 @@ function buildSummarySheet(workbook, rows, config, scopeLabel) {
   styleHeader(sheet.getRange("A3:D3"));
 
   const pairRows = [];
-  const formulaRows = [];
   for (let index = 0; index < rows.length; index += 2) {
     const left = rows[index];
     const right = rows[index + 1];
-    pairRows.push([left?.bvid ?? "", "", right?.bvid ?? "", ""]);
-    formulaRows.push(["", left ? hyperlinkFormula(left.url) : "", "", right ? hyperlinkFormula(right.url) : ""]);
+    pairRows.push([left?.bvid ?? "", left?.url ?? "", right?.bvid ?? "", right?.url ?? ""]);
   }
   if (!pairRows.length) {
     pairRows.push(["暂无符合条件的视频", "", "", ""]);
-    formulaRows.push(["", "", "", ""]);
   }
   const endRow = 3 + pairRows.length;
   sheet.getRange(`A4:D${endRow}`).values = pairRows;
-  sheet.getRange(`B4:B${endRow}`).formulas = formulaRows.map((row) => [row[1]]);
-  sheet.getRange(`D4:D${endRow}`).formulas = formulaRows.map((row) => [row[3]]);
   sheet.getRange(`A4:D${endRow}`).format = {
     fill: COLORS.white,
     font: { color: COLORS.text },
@@ -141,25 +133,22 @@ function buildDetailSheet(workbook, rows, config, scopeLabel) {
 
   const values = rows.map((row) => [
     row.bvid,
-    "",
+    row.url,
     row.title,
     Number(row.play),
-    toDate(row.pubdate),
+    toChinaExcelDate(row.pubdate),
     row.author,
     row.category,
     row.keywords,
-    toDate(row.first_qualified_at),
-    toDate(row.last_checked_at),
+    toChinaExcelDate(row.first_qualified_at),
+    toChinaExcelDate(row.last_checked_at),
     row.relevance_reason,
   ]);
-  const formulas = rows.map((row) => ["", hyperlinkFormula(row.url), "", "", "", "", "", "", "", "", ""]);
   if (!values.length) {
     values.push(["暂无符合条件的视频", "", "", 0, null, "", "", "", null, null, ""]);
-    formulas.push(new Array(headers.length).fill(""));
   }
   const endRow = 3 + values.length;
   sheet.getRange(`A4:${lastCol}${endRow}`).values = values;
-  sheet.getRange(`B4:B${endRow}`).formulas = formulas.map((row) => [row[1]]);
   sheet.getRange(`A4:${lastCol}${endRow}`).format = {
     font: { color: COLORS.text },
     verticalAlignment: "center",
@@ -233,8 +222,8 @@ export async function exportWorkbook({ rows, config, outputPath, scopeLabel = ""
     tableMaxRows: 10, tableMaxCols: 11, maxChars: 7000,
   });
   const errors = await workbook.inspect({
-    kind: "match", searchTerm: "#REF!|#DIV/0!|#VALUE!|#NAME\\?|#N/A",
-    options: { useRegex: true, maxResults: 100 }, summary: "final formula error scan",
+    kind: "match", searchTerm: "#REF!|#DIV/0!|#VALUE!|#NAME\\?|#N/A|HYPERLINK is not implemented",
+    options: { useRegex: true, maxResults: 100 }, summary: "final compatibility error scan",
   });
 
   if (qaDir) {
@@ -246,8 +235,8 @@ export async function exportWorkbook({ rows, config, outputPath, scopeLabel = ""
     await fs.writeFile(path.join(qaDir, "inspect.txt"), `${summaryCheck.ndjson}\n${detailCheck.ndjson}\n${errors.ndjson}\n`, "utf8");
   }
 
-  if (/"(?:value|text)":"#(?:REF!|DIV\/0!|VALUE!|NAME\?|N\/A)"/.test(errors.ndjson)) {
-    throw new Error(`Excel 公式错误扫描未通过：${errors.ndjson.slice(0, 1000)}`);
+  if (/"(?:value|text)":"(?:#(?:REF!|DIV\/0!|VALUE!|NAME\?|N\/A)|HYPERLINK is not implemented)/.test(errors.ndjson)) {
+    throw new Error(`Excel 兼容性错误扫描未通过：${errors.ndjson.slice(0, 1000)}`);
   }
   await atomicSave(workbook, outputPath);
   return { outputPath, rowCount: rows.length };

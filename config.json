@@ -22,6 +22,7 @@
   "maxSplitDepth": 18,
   "lockStaleMinutes": 720,
   "logRetentionDays": 30,
+  "excelExportAfterScan": false,
   "keywordGroups": [
     { "label": "agent", "queries": ["agent"], "ambiguous": true },
     { "label": "AI", "queries": ["AI"], "ambiguous": true },

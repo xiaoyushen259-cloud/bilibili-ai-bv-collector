@@ -1,6 +1,9 @@
 node_modules/
 data/
+data/feishu-config.json
 logs/
 qa/
 output/
+outputs/
+配置飞书同步.cmd
 *.inspect.ndjson

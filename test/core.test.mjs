@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { containsTerm, evaluateRelevance, isWithinWindow, normalizeVideo, parsePlay, shouldSplitWindow } from "../src/core.mjs";
-import { buildScanUnits, isRateLimitError, splitWindowNewestFirst } from "../app.mjs";
+import { buildScanUnits, isRateLimitError, shouldExportExcelAfterScan, splitWindowNewestFirst } from "../app.mjs";
 
 const config = JSON.parse(await fs.readFile(new URL("../config.json", import.meta.url), "utf8"));
 const group = (label) => config.keywordGroups.find((entry) => entry.label === label);
@@ -90,4 +90,10 @@ test("仅将B站412和v_voucher识别为可延期限流", () => {
   assert.equal(isRateLimitError(new Error("HTTP 412: request was banned")), true);
   assert.equal(isRateLimitError(new Error("B站接口返回结构异常 v_voucher")), true);
   assert.equal(isRateLimitError(new Error("HTTP 500")), false);
+});
+
+test("自动采集默认不导出 Excel，飞书同步直接读取 SQLite", () => {
+  assert.equal(shouldExportExcelAfterScan({}), false);
+  assert.equal(shouldExportExcelAfterScan({ excelExportAfterScan: false }), false);
+  assert.equal(shouldExportExcelAfterScan({ excelExportAfterScan: true }), true);
 });
