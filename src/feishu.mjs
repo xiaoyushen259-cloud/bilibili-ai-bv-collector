@@ -2,8 +2,8 @@ import fs from "node:fs/promises";
 
 const FEISHU_API_BASE = "https://open.feishu.cn/open-apis";
 export const FEISHU_HEADERS = [
-  "BV号", "视频直链", "标题", "播放量", "发布时间", "UP主", "分区",
-  "命中关键词", "首次收集时间", "最近检查时间", "相关性依据",
+  "BV号", "视频直链", "标题", "内容分区", "播放量", "发布时间", "UP主", "B站分区",
+  "关键词组", "命中关键词", "首次收集时间", "最近检查时间", "相关性依据",
 ];
 
 function sleep(ms) {
@@ -42,11 +42,13 @@ export function buildFeishuMatrix(rows) {
       row.bvid,
       row.url,
       row.title,
+      row.content_partitions ?? "",
       Number(row.play),
       formatChinaDateTime(row.pubdate),
       row.author,
       row.category,
       row.keywords,
+      row.matched_queries ?? "",
       formatChinaDateTime(row.first_qualified_at),
       formatChinaDateTime(row.last_checked_at),
       row.relevance_reason,
@@ -147,14 +149,82 @@ export class FeishuSheetsClient {
 
   async resolveSheetId() {
     if (this.settings.sheetId) return this.settings.sheetId;
+    const sheets = await this.listSheets();
+    const sheetId = sheets[0]?.sheetId;
+    if (!sheetId) throw new Error("目标飞书电子表格没有可写工作表，且链接中未包含 sheet 参数");
+    this.settings.sheetId = sheetId;
+    return sheetId;
+  }
+
+  async listSheets() {
     const payload = await this.request(
       `/sheets/v3/spreadsheets/${encodeURIComponent(this.settings.spreadsheetToken)}/sheets/query`
     );
     const sheets = payload.data?.sheets ?? payload.data?.items ?? [];
-    const sheetId = sheets[0]?.sheet_id ?? sheets[0]?.sheetId;
-    if (!sheetId) throw new Error("目标飞书电子表格没有可写工作表，且链接中未包含 sheet 参数");
-    this.settings.sheetId = sheetId;
-    return sheetId;
+    return sheets.map((sheet) => ({
+      sheetId: sheet.sheet_id ?? sheet.sheetId ?? sheet.properties?.sheetId,
+      title: sheet.title ?? sheet.name ?? sheet.properties?.title ?? "",
+      index: Number(sheet.index ?? sheet.properties?.index ?? 0),
+    })).filter((sheet) => sheet.sheetId);
+  }
+
+  async addSheet(title, index) {
+    const payload = await this.request(
+      `/sheets/v2/spreadsheets/${encodeURIComponent(this.settings.spreadsheetToken)}/sheets_batch_update`,
+      {
+        method: "POST",
+        body: { requests: [{ addSheet: { properties: { title, index } } }] },
+      },
+    );
+    const properties = payload.data?.replies?.[0]?.addSheet?.properties
+      ?? payload.data?.replies?.[0]?.add_sheet?.properties;
+    const sheetId = properties?.sheetId ?? properties?.sheet_id;
+    if (!sheetId) throw new Error(`飞书已响应新增工作表“${title}”，但未返回 sheetId`);
+    return { sheetId, title, index: Number(properties?.index ?? index) };
+  }
+
+  async deleteSheets(sheetIds) {
+    if (!sheetIds.length) return [];
+    await this.request(
+      `/sheets/v2/spreadsheets/${encodeURIComponent(this.settings.spreadsheetToken)}/sheets_batch_update`,
+      {
+        method: "POST",
+        body: { requests: sheetIds.map((sheetId) => ({ deleteSheet: { sheetId } })) },
+      },
+    );
+    return sheetIds;
+  }
+
+  async ensurePartitionSheets(partitions, mainSheetId) {
+    if (!partitions.length) return [];
+    const sheets = await this.listSheets();
+    const byTitle = new Map(sheets.map((sheet) => [sheet.title, sheet]));
+    const resolved = [];
+    let nextIndex = sheets.length;
+    for (const partition of partitions) {
+      let sheet = byTitle.get(partition.name);
+      if (sheet?.sheetId === mainSheetId) {
+        throw new Error(`分区工作表“${partition.name}”与主工作表重名，请修改 partitionName 或 mergeInto`);
+      }
+      if (!sheet) {
+        sheet = await this.addSheet(partition.name, nextIndex);
+        nextIndex += 1;
+        byTitle.set(partition.name, sheet);
+      }
+      resolved.push({ ...partition, sheetId: sheet.sheetId });
+    }
+    return resolved;
+  }
+
+  async removeStalePartitionSheets(activeNames, managedNames, mainSheetId) {
+    if (!managedNames.length) return [];
+    const active = new Set(activeNames);
+    const managed = new Set(managedNames);
+    const stale = (await this.listSheets()).filter((sheet) => (
+      sheet.sheetId !== mainSheetId && managed.has(sheet.title) && !active.has(sheet.title)
+    ));
+    await this.deleteSheets(stale.map((sheet) => sheet.sheetId));
+    return stale.map((sheet) => sheet.title);
   }
 
   async doctor() {
@@ -181,24 +251,27 @@ export class FeishuSheetsClient {
       `/sheets/v2/spreadsheets/${encodeURIComponent(this.settings.spreadsheetToken)}/values/${encodeURIComponent(range)}`,
     );
     const values = payload.data?.valueRange?.values ?? payload.data?.value_range?.values ?? [];
-    return Array.isArray(values) ? values.length : 0;
+    if (!Array.isArray(values)) return 0;
+    for (let index = values.length - 1; index >= 0; index -= 1) {
+      if (String(values[index]?.[0] ?? "").trim()) return index + 1;
+    }
+    return 0;
   }
 
-  async clearRows(sheetId, startRow, endRow, lastColumn) {
+  async clearRows(sheetId, startRow, endRow, lastColumn, columnCount = FEISHU_HEADERS.length) {
     if (startRow > endRow) return;
     for (let offset = startRow; offset <= endRow; offset += this.settings.batchRows) {
       const batchEnd = Math.min(endRow, offset + this.settings.batchRows - 1);
       const blankRows = Array.from(
         { length: batchEnd - offset + 1 },
-        () => new Array(FEISHU_HEADERS.length).fill(""),
+        () => new Array(columnCount).fill(""),
       );
       await this.writeRange(`${sheetId}!A${offset}:${lastColumn}${batchEnd}`, blankRows);
       if (batchEnd < endRow) await this.sleepImpl(350);
     }
   }
 
-  async sync(rows) {
-    const sheetId = await this.resolveSheetId();
+  async syncSheet(sheetId, rows) {
     const matrix = buildFeishuMatrix(rows);
     const lastColumn = excelColumnName(FEISHU_HEADERS.length - 1);
     const previousRowCount = await this.readRowCount(sheetId);
@@ -209,12 +282,36 @@ export class FeishuSheetsClient {
       await this.writeRange(`${sheetId}!A${startRow}:${lastColumn}${endRow}`, batch);
       if (endRow < matrix.length) await this.sleepImpl(350);
     }
-    await this.clearRows(sheetId, matrix.length + 1, previousRowCount, lastColumn);
+    await this.clearRows(sheetId, matrix.length + 1, previousRowCount, lastColumn, FEISHU_HEADERS.length);
+    return { rowCount: rows.length, firstBvid: matrix[1]?.[0] ?? null, sheetId };
+  }
+
+  async sync(rows, { partitions = [], managedPartitionNames = [] } = {}) {
+    const sheetId = await this.resolveSheetId();
+    const mainResult = await this.syncSheet(sheetId, rows);
+    const partitionSheets = await this.ensurePartitionSheets(partitions, sheetId);
+    const partitionResults = [];
+    for (const partition of partitionSheets) {
+      const result = await this.syncSheet(partition.sheetId, partition.rows);
+      partitionResults.push({ name: partition.name, ...result });
+      await this.sleepImpl(350);
+    }
+    const removedPartitions = await this.removeStalePartitionSheets(
+      partitions.map((partition) => partition.name),
+      managedPartitionNames,
+      sheetId,
+    );
     return {
-      rowCount: rows.length,
-      firstBvid: matrix[1]?.[0] ?? null,
+      rowCount: mainResult.rowCount,
+      firstBvid: mainResult.firstBvid,
       sheetId,
       sheetUrl: this.settings.sheetUrl,
+      partitions: partitionResults.map((partition) => ({
+        name: partition.name,
+        rowCount: partition.rowCount,
+        sheetId: partition.sheetId,
+      })),
+      removedPartitions,
     };
   }
 }

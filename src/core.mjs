@@ -1,3 +1,5 @@
+import { activeKeywordGroups, matchTermsForGroup } from "./rules.mjs";
+
 const AMBIGUOUS_BOUNDARY_TERMS = new Set(["ai", "mj", "sd"]);
 
 export function stripHtml(value = "") {
@@ -47,7 +49,7 @@ export function searchableText(item) {
 
 export function evaluateRelevance(item, group, config) {
   const text = searchableText(item);
-  const matchedQuery = group.queries.find((query) => containsTerm(text, query));
+  const matchedQuery = matchTermsForGroup(group).find((query) => containsTerm(text, query));
   if (!matchedQuery) {
     return { accepted: false, reason: `搜索结果正文未直接出现关键词组“${group.label}”` };
   }
@@ -55,9 +57,9 @@ export function evaluateRelevance(item, group, config) {
     return { accepted: true, reason: `强关键词命中：${matchedQuery}`, matchedQuery };
   }
 
-  const otherStrong = config.keywordGroups
+  const otherStrong = activeKeywordGroups(config)
     .filter((candidate) => !candidate.ambiguous && candidate.label !== group.label)
-    .flatMap((candidate) => candidate.queries.map((query) => ({ label: candidate.label, query })))
+    .flatMap((candidate) => matchTermsForGroup(candidate).map((query) => ({ label: candidate.label, query })))
     .find(({ query }) => containsTerm(text, query));
   if (otherStrong) {
     return {
@@ -107,7 +109,8 @@ export function canonicalVideoUrl(bvid) {
 }
 
 export function flattenKeywordGroups(config) {
-  return config.keywordGroups.flatMap((group) => group.queries.map((query) => ({ ...group, query })));
+  return activeKeywordGroups(config)
+    .flatMap((group) => group.queries.map((query) => ({ ...group, query })));
 }
 
 export function shouldSplitWindow({ numPages, lastPageItems, minViews, startTs, endTs, minSplitMinutes, depth, maxSplitDepth }) {

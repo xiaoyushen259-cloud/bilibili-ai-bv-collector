@@ -20,6 +20,11 @@ test("BV号去重且多关键词合并", () => {
   assert.match(rows[0].keywords, /AI/);
   assert.match(rows[0].keywords, /GPT/);
   assert.equal(rows[0].first_qualified_at, 2000);
+  const aiOnly = db.listVideos({ cutoffTs: 0, minViews: 10000, keywordGroups: ["AI"] });
+  assert.equal(aiOnly.length, 1);
+  assert.equal(aiOnly[0].keywords, "AI");
+  assert.equal(aiOnly[0].matched_queries, "AI");
+  assert.equal(db.listVideos({ cutoffTs: 0, minViews: 10000, keywordGroups: ["不存在"] }).length, 0);
   db.close();
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
