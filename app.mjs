@@ -1,12 +1,14 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { BilibiliClient } from "./src/bilibili.mjs";
 import { CollectorDatabase } from "./src/db.mjs";
 import { evaluateRelevance, flattenKeywordGroups, isWithinWindow, normalizeVideo } from "./src/core.mjs";
 import { exportWorkbook } from "./src/exporter.mjs";
 import { buildFeishuMatrix, FeishuSheetsClient, loadFeishuSettings } from "./src/feishu.mjs";
+import { activeKeywordGroups, buildPartitionDatasets, validateCollectorRules } from "./src/rules.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(ROOT, "config.json");
@@ -53,7 +55,7 @@ function lastCompletedWeek(now = new Date()) {
 }
 
 async function loadConfig() {
-  return JSON.parse(await fs.readFile(CONFIG_PATH, "utf8"));
+  return validateCollectorRules(JSON.parse(await fs.readFile(CONFIG_PATH, "utf8")));
 }
 
 async function ensureDirectories() {
@@ -158,7 +160,12 @@ function buildScanUnits(mode, queries, job, config) {
 }
 
 function jobProgressKind(mode, config) {
-  return mode === "full" ? `segment-v2-time-first-${config.fullSegmentHours ?? 24}h` : "query-v1";
+  const keywordSignature = activeKeywordGroups(config)
+    .flatMap((group) => group.queries.map((query) => `${group.label}:${query}`))
+    .join("|");
+  const fingerprint = createHash("sha256").update(keywordSignature).digest("hex").slice(0, 10);
+  const base = mode === "full" ? `segment-v2-time-first-${config.fullSegmentHours ?? 24}h` : "query-v1";
+  return `${base}-kw-${fingerprint}`;
 }
 
 export function shouldExportExcelAfterScan(config) {
@@ -167,8 +174,12 @@ export function shouldExportExcelAfterScan(config) {
 
 async function exportScope(db, config, scope, { qa = false } = {}) {
   const cutoffTs = nowSeconds() - config.lookbackDays * 86400;
+  const keywordGroups = activeKeywordGroups(config).map((group) => group.label);
   if (scope === "master") {
-    const rows = db.listVideos({ cutoffTs, minViews: config.minViews });
+    const rows = buildPartitionDatasets(
+      db.listVideos({ cutoffTs, minViews: config.minViews, keywordGroups }),
+      config,
+    ).rows;
     return exportWorkbook({
       rows,
       config,
@@ -179,12 +190,13 @@ async function exportScope(db, config, scope, { qa = false } = {}) {
   }
   if (scope === "weekly") {
     const week = lastCompletedWeek();
-    const rows = db.listVideos({
+    const rows = buildPartitionDatasets(db.listVideos({
       cutoffTs,
       firstQualifiedStart: week.start,
       firstQualifiedEnd: week.end,
       minViews: config.minViews,
-    });
+      keywordGroups,
+    }), config).rows;
     const startLabel = chinaDateString(new Date(week.start * 1000));
     const endLabel = chinaDateString(new Date((week.end - 1) * 1000));
     return exportWorkbook({
@@ -363,15 +375,16 @@ async function runCycle({ qa = false } = {}) {
   return { incremental, backfill, feishu };
 }
 
-async function qualifiedRowsSnapshot() {
-  const config = await loadConfig();
+async function qualifiedRowsSnapshot(config = null) {
+  const activeConfig = config ?? await loadConfig();
   await ensureDirectories();
-  const releaseLock = await acquireLock(config);
+  const releaseLock = await acquireLock(activeConfig);
   const db = new CollectorDatabase(DB_PATH);
   try {
     return db.listVideos({
-      cutoffTs: nowSeconds() - config.lookbackDays * 86400,
-      minViews: config.minViews,
+      cutoffTs: nowSeconds() - activeConfig.lookbackDays * 86400,
+      minViews: activeConfig.minViews,
+      keywordGroups: activeKeywordGroups(activeConfig).map((group) => group.label),
     });
   } finally {
     db.close();
@@ -380,10 +393,18 @@ async function qualifiedRowsSnapshot() {
 }
 
 async function runFeishu(action = "preview", { settings: suppliedSettings = null } = {}) {
+  const config = await loadConfig();
   if (action === "preview") {
-    const rows = await qualifiedRowsSnapshot();
-    const matrix = buildFeishuMatrix(rows);
-    const preview = { rowCount: rows.length, headers: matrix[0], firstRows: matrix.slice(1, 6) };
+    const snapshot = await qualifiedRowsSnapshot(config);
+    const datasets = buildPartitionDatasets(snapshot, config);
+    const matrix = buildFeishuMatrix(datasets.rows);
+    const preview = {
+      rowCount: datasets.rows.length,
+      keywordCounts: datasets.keywordCounts ?? null,
+      partitionCounts: Object.fromEntries(datasets.partitions.map((partition) => [partition.name, partition.rows.length])),
+      headers: matrix[0],
+      firstRows: matrix.slice(1, 6),
+    };
     console.log(JSON.stringify(preview, null, 2));
     return preview;
   }
@@ -400,8 +421,12 @@ async function runFeishu(action = "preview", { settings: suppliedSettings = null
     return result;
   }
   if (action === "sync") {
-    const rows = await qualifiedRowsSnapshot();
-    const result = await client.sync(rows);
+    const snapshot = await qualifiedRowsSnapshot(config);
+    const datasets = buildPartitionDatasets(snapshot, config);
+    const result = await client.sync(datasets.rows, {
+      partitions: datasets.partitions,
+      managedPartitionNames: datasets.managedPartitionNames,
+    });
     await log(`飞书同步完成：${result.rowCount} 条，最新 BV号 ${result.firstBvid ?? "无"}`);
     console.log(JSON.stringify(result, null, 2));
     return result;
@@ -444,11 +469,17 @@ async function doctor() {
     platform: `${process.platform} ${process.arch}`,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     configuredTimezone: config.timezone,
+    activeKeywordGroups: activeKeywordGroups(config).length,
+    partitioning: config.partitioning ?? null,
     config: fsSync.existsSync(CONFIG_PATH),
     artifactTool: true,
     database: fsSync.existsSync(DB_PATH),
     schedulerCommand: process.platform === "win32" && fsSync.existsSync("C:\\Windows\\System32\\schtasks.exe"),
-    stats: db.stats(nowSeconds() - config.lookbackDays * 86400, config.minViews),
+    stats: db.stats(
+      nowSeconds() - config.lookbackDays * 86400,
+      config.minViews,
+      activeKeywordGroups(config).map((group) => group.label),
+    ),
   };
   db.close();
   console.log(JSON.stringify(checks, null, 2));

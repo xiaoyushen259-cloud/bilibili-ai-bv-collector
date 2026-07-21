@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import { containsTerm, evaluateRelevance, isWithinWindow, normalizeVideo, parsePlay, shouldSplitWindow } from "../src/core.mjs";
+import { containsTerm, evaluateRelevance, flattenKeywordGroups, isWithinWindow, normalizeVideo, parsePlay, shouldSplitWindow } from "../src/core.mjs";
 import { buildScanUnits, isRateLimitError, shouldExportExcelAfterScan, splitWindowNewestFirst } from "../app.mjs";
+import { buildPartitionDatasets, validateCollectorRules } from "../src/rules.mjs";
 
 const config = JSON.parse(await fs.readFile(new URL("../config.json", import.meta.url), "utf8"));
 const group = (label) => config.keywordGroups.find((entry) => entry.label === label);
+const ambiguousSdGroup = { label: "SD", queries: ["SD"], matchTerms: ["SD"], ambiguous: true };
 
 test("播放量解析和阈值边界", () => {
   assert.equal(parsePlay(9999), 9999);
@@ -28,19 +30,73 @@ test("AI/MJ/SD 使用英文边界", () => {
 });
 
 test("WWE SD 被平衡过滤拒绝", () => {
-  const result = evaluateRelevance({ title: "WWE SD 赛事集锦", tag: "摔角,体育", description: "比赛回放" }, group("SD"), config);
+  const result = evaluateRelevance({ title: "WWE SD 赛事集锦", tag: "摔角,体育", description: "比赛回放" }, ambiguousSdGroup, config);
   assert.equal(result.accepted, false);
 });
 
 test("SD 与 AI 上下文共同命中时通过", () => {
-  const result = evaluateRelevance({ title: "SD 绘画工作流教程", tag: "扩散模型,AI绘画", description: "ComfyUI 模型分享" }, group("SD"), config);
+  const result = evaluateRelevance({ title: "SD 绘画工作流教程", tag: "扩散模型,AI绘画", description: "ComfyUI 模型分享" }, ambiguousSdGroup, config);
   assert.equal(result.accepted, true);
 });
 
-test("Claude Code 别名统一归入 cloudecode", () => {
-  const result = evaluateRelevance({ title: "Claude Code 从入门到实战", tag: "AI编程", description: "" }, group("cloudecode"), config);
+test("Seedance 2.0 别名统一归入 seedance2.0", () => {
+  const result = evaluateRelevance({ title: "Seedance 2.0 视频生成实战", tag: "AI视频", description: "" }, group("seedance2.0"), config);
   assert.equal(result.accepted, true);
-  assert.equal(result.matchedQuery, "Claude Code");
+  assert.equal(result.matchedQuery, "Seedance 2.0");
+});
+
+test("搜索词与视频实际命中词可分别配置，并可停用关键词组", () => {
+  const customConfig = {
+    keywordGroups: [
+      { label: "自定义", queries: ["搜索用词"], matchTerms: ["正文命中词"], ambiguous: false },
+      { label: "停用", queries: ["不应搜索"], enabled: false, ambiguous: false },
+    ],
+    aiContextTerms: [],
+  };
+  assert.equal(evaluateRelevance({ title: "正文命中词教程" }, customConfig.keywordGroups[0], customConfig).accepted, true);
+  assert.equal(evaluateRelevance({ title: "只有搜索用词" }, customConfig.keywordGroups[0], customConfig).accepted, false);
+  assert.deepEqual(flattenKeywordGroups(customConfig).map((entry) => entry.query), ["搜索用词"]);
+});
+
+test("视频可进入多个内容分区，未命中分区规则时进入兜底分区", () => {
+  const partitionConfig = {
+    keywordGroups: [{ label: "MJ", queries: ["MJ"], ambiguous: false }],
+    contentPartitions: [
+      { name: "MJ分区", keywordGroups: ["MJ"] },
+      { name: "绘画分区", matchTerms: ["midjourney"] },
+      { name: "其他AI", fallback: true },
+    ],
+  };
+  validateCollectorRules(partitionConfig);
+  const result = buildPartitionDatasets([
+    { bvid: "BV1234567890", keywords: "MJ", matched_queries: "midjourney" },
+    { bvid: "BV1234567891", keywords: "AI", matched_queries: "AI" },
+  ], partitionConfig);
+  assert.equal(result.rows[0].content_partitions, "MJ分区、绘画分区");
+  assert.equal(result.rows[1].content_partitions, "其他AI");
+  assert.deepEqual(result.partitions.map((partition) => partition.rows.length), [1, 1, 1]);
+});
+
+test("关键词达到阈值后独立分区，低于阈值时并入相关分区", () => {
+  const dynamicConfig = {
+    keywordGroups: [
+      { label: "agent", queries: ["agent"], partitionName: "Agent分区", mergeInto: "Agent相关分区" },
+      { label: "codex", queries: ["codex"], partitionName: "Codex分区", mergeInto: "agent" },
+      { label: "MJ", queries: ["MJ"], partitionName: "MJ分区", mergeInto: "AI绘画分区" },
+    ],
+    partitioning: { minStandaloneVideos: 2, fallbackPartition: "其他AI" },
+  };
+  const result = buildPartitionDatasets([
+    { bvid: "BV1234567890", keywords: "agent", matched_queries: "agent" },
+    { bvid: "BV1234567891", keywords: "agent", matched_queries: "agent" },
+    { bvid: "BV1234567892", keywords: "codex", matched_queries: "codex" },
+    { bvid: "BV1234567893", keywords: "MJ", matched_queries: "MJ" },
+  ], dynamicConfig);
+  assert.deepEqual(result.partitions.map((partition) => [partition.name, partition.rows.length]), [
+    ["Agent分区", 3], ["AI绘画分区", 1],
+  ]);
+  assert.equal(result.rows[2].content_partitions, "Agent分区");
+  assert.equal(result.rows[3].content_partitions, "AI绘画分区");
 });
 
 test("视频字段清洗和规范化链接", () => {

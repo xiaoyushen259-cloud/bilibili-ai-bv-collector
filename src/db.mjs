@@ -222,7 +222,13 @@ export class CollectorDatabase {
     return existing ? "updated" : "inserted";
   }
 
-  listVideos({ cutoffTs = 0, firstQualifiedStart = null, firstQualifiedEnd = null, minViews = 0 } = {}) {
+  listVideos({
+    cutoffTs = 0,
+    firstQualifiedStart = null,
+    firstQualifiedEnd = null,
+    minViews = 0,
+    keywordGroups = null,
+  } = {}) {
     const clauses = ["v.pubdate >= ?", "v.play >= ?"];
     const params = [cutoffTs, minViews];
     if (firstQualifiedStart !== null) {
@@ -235,23 +241,36 @@ export class CollectorDatabase {
     }
     const rows = this.db.prepare(`
       SELECT v.*,
-        (SELECT GROUP_CONCAT(k.keyword_group, ',') FROM keyword_hits k WHERE k.bvid=v.bvid) AS keywords,
-        (SELECT GROUP_CONCAT(k.matched_query, ',') FROM keyword_hits k WHERE k.bvid=v.bvid) AS matched_queries
+        (SELECT GROUP_CONCAT(k.keyword_group || char(31) || k.matched_query, char(30))
+          FROM keyword_hits k WHERE k.bvid=v.bvid) AS keyword_hit_pairs
       FROM videos v
       WHERE ${clauses.join(" AND ")}
       ORDER BY v.first_qualified_at DESC, v.play DESC, v.bvid ASC
     `).all(...params);
-    return rows.map((row) => ({
-      ...row,
-      keywords: [...new Set(String(row.keywords ?? "").split(",").filter(Boolean))].sort().join("、"),
-      matched_queries: [...new Set(String(row.matched_queries ?? "").split(",").filter(Boolean))].sort().join("、"),
-    }));
+    const allowed = keywordGroups?.length
+      ? new Set(keywordGroups.map((label) => String(label).toLocaleLowerCase("en-US")))
+      : null;
+    return rows.map((row) => {
+      const hits = String(row.keyword_hit_pairs ?? "").split(String.fromCharCode(30))
+        .filter(Boolean)
+        .map((pair) => {
+          const [keywordGroup, matchedQuery = ""] = pair.split(String.fromCharCode(31));
+          return { keywordGroup, matchedQuery };
+        })
+        .filter((hit) => !allowed || allowed.has(hit.keywordGroup.toLocaleLowerCase("en-US")));
+      if (allowed && !hits.length) return null;
+      const { keyword_hit_pairs: ignored, ...video } = row;
+      return {
+        ...video,
+        keywords: [...new Set(hits.map((hit) => hit.keywordGroup).filter(Boolean))].sort().join("、"),
+        matched_queries: [...new Set(hits.map((hit) => hit.matchedQuery).filter(Boolean))].sort().join("、"),
+      };
+    }).filter(Boolean);
   }
 
-  stats(cutoffTs, minViews) {
-    const video = this.db.prepare("SELECT COUNT(*) AS count FROM videos WHERE pubdate>=? AND play>=?")
-      .get(cutoffTs, minViews);
+  stats(cutoffTs, minViews, keywordGroups = null) {
+    const qualifiedVideos = this.listVideos({ cutoffTs, minViews, keywordGroups }).length;
     const lastRun = this.db.prepare("SELECT * FROM runs ORDER BY id DESC LIMIT 1").get();
-    return { qualifiedVideos: Number(video?.count ?? 0), lastRun: lastRun ?? null };
+    return { qualifiedVideos, lastRun: lastRun ?? null };
   }
 }

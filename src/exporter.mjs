@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { SpreadsheetFile, Workbook } from "@oai/artifact-tool";
+import { activeKeywordGroups, buildPartitionDatasets } from "./rules.mjs";
 
 const COLORS = {
   navy: "#12304A",
@@ -70,7 +71,7 @@ function buildSummarySheet(workbook, rows, config, scopeLabel) {
   styleTitle(sheet, "A1:D1");
 
   sheet.getRange("A2:D2").merge();
-  sheet.getRange("A2").values = [[`关键词：${config.keywordGroups.map((group) => group.label).join("、")}　|　门槛：播放量 ≥ ${config.minViews.toLocaleString("zh-CN")}　|　滚动 ${config.lookbackDays} 天　|　导出：${formatChinaTime()}`]];
+  sheet.getRange("A2").values = [[`关键词：${activeKeywordGroups(config).map((group) => group.label).join("、")}　|　门槛：播放量 ≥ ${config.minViews.toLocaleString("zh-CN")}　|　滚动 ${config.lookbackDays} 天　|　导出：${formatChinaTime()}`]];
   sheet.getRange("A2:D2").format = {
     fill: COLORS.cyan,
     font: { color: COLORS.text, fontSize: 10 },
@@ -114,8 +115,8 @@ function buildDetailSheet(workbook, rows, config, scopeLabel) {
   const sheet = workbook.worksheets.add("视频明细");
   sheet.showGridLines = false;
   const headers = [
-    "BV号", "视频链接", "标题", "播放量", "发布时间", "UP主", "分区",
-    "命中关键词", "首次达标时间", "最近检查时间", "相关性依据",
+    "BV号", "视频链接", "标题", "内容分区", "播放量", "发布时间", "UP主", "B站分区",
+    "关键词组", "命中关键词", "首次达标时间", "最近检查时间", "相关性依据",
   ];
   const lastCol = excelColumnName(headers.length - 1);
   sheet.getRange(`A1:${lastCol}1`).merge();
@@ -135,17 +136,19 @@ function buildDetailSheet(workbook, rows, config, scopeLabel) {
     row.bvid,
     row.url,
     row.title,
+    row.content_partitions ?? "",
     Number(row.play),
     toChinaExcelDate(row.pubdate),
     row.author,
     row.category,
     row.keywords,
+    row.matched_queries ?? "",
     toChinaExcelDate(row.first_qualified_at),
     toChinaExcelDate(row.last_checked_at),
     row.relevance_reason,
   ]);
   if (!values.length) {
-    values.push(["暂无符合条件的视频", "", "", 0, null, "", "", "", null, null, ""]);
+    values.push(["暂无符合条件的视频", "", "", "", 0, null, "", "", "", "", null, null, ""]);
   }
   const endRow = 3 + values.length;
   sheet.getRange(`A4:${lastCol}${endRow}`).values = values;
@@ -155,21 +158,21 @@ function buildDetailSheet(workbook, rows, config, scopeLabel) {
     borders: { insideHorizontal: { style: "thin", color: COLORS.border } },
   };
   sheet.getRange(`B4:B${endRow}`).format.font = { color: COLORS.blue };
-  sheet.getRange(`D4:D${endRow}`).format.numberFormat = "#,##0";
-  sheet.getRange(`E4:E${endRow}`).format.numberFormat = "yyyy-mm-dd hh:mm";
-  sheet.getRange(`I4:J${endRow}`).format.numberFormat = "yyyy-mm-dd hh:mm";
-  sheet.getRange(`D4:D${endRow}`).conditionalFormats.add("cellIs", {
+  sheet.getRange(`E4:E${endRow}`).format.numberFormat = "#,##0";
+  sheet.getRange(`F4:F${endRow}`).format.numberFormat = "yyyy-mm-dd hh:mm";
+  sheet.getRange(`K4:L${endRow}`).format.numberFormat = "yyyy-mm-dd hh:mm";
+  sheet.getRange(`E4:E${endRow}`).conditionalFormats.add("cellIs", {
     operator: "greaterThanOrEqual",
     formula: config.minViews,
     format: { fill: COLORS.green, font: { color: COLORS.greenText, bold: true } },
   });
 
-  const widths = [17, 43, 48, 13, 19, 20, 14, 24, 19, 19, 48];
+  const widths = [17, 43, 48, 22, 13, 19, 20, 14, 24, 24, 19, 19, 48];
   widths.forEach((width, index) => {
     sheet.getRange(`${excelColumnName(index)}1:${excelColumnName(index)}${endRow}`).format.columnWidth = width;
   });
   sheet.getRange(`C4:C${endRow}`).format.wrapText = true;
-  sheet.getRange(`K4:K${endRow}`).format.wrapText = true;
+  sheet.getRange(`M4:M${endRow}`).format.wrapText = true;
   sheet.getRange(`A4:${lastCol}${endRow}`).format.rowHeight = 34;
   sheet.freezePanes.freezeRows(3);
   sheet.freezePanes.freezeColumns(2);
@@ -209,17 +212,18 @@ async function atomicSave(workbook, finalPath) {
 }
 
 export async function exportWorkbook({ rows, config, outputPath, scopeLabel = "", qaDir = null }) {
+  const datasets = buildPartitionDatasets(rows, config);
   const workbook = Workbook.create();
-  buildSummarySheet(workbook, rows, config, scopeLabel);
-  buildDetailSheet(workbook, rows, config, scopeLabel);
+  buildSummarySheet(workbook, datasets.rows, config, scopeLabel);
+  buildDetailSheet(workbook, datasets.rows, config, scopeLabel);
 
   const summaryCheck = await workbook.inspect({
     kind: "table", sheetId: "BV汇总", range: "A1:D12", include: "values,formulas",
     tableMaxRows: 12, tableMaxCols: 4, maxChars: 5000,
   });
   const detailCheck = await workbook.inspect({
-    kind: "table", sheetId: "视频明细", range: "A1:K10", include: "values,formulas",
-    tableMaxRows: 10, tableMaxCols: 11, maxChars: 7000,
+    kind: "table", sheetId: "视频明细", range: "A1:M10", include: "values,formulas",
+    tableMaxRows: 10, tableMaxCols: 13, maxChars: 8000,
   });
   const errors = await workbook.inspect({
     kind: "match", searchTerm: "#REF!|#DIV/0!|#VALUE!|#NAME\\?|#N/A|HYPERLINK is not implemented",
@@ -229,7 +233,7 @@ export async function exportWorkbook({ rows, config, outputPath, scopeLabel = ""
   if (qaDir) {
     await fs.mkdir(qaDir, { recursive: true });
     const summaryPreview = await workbook.render({ sheetName: "BV汇总", autoCrop: "all", scale: 1.25, format: "png" });
-    const detailPreview = await workbook.render({ sheetName: "视频明细", range: "A1:K12", scale: 1.1, format: "png" });
+    const detailPreview = await workbook.render({ sheetName: "视频明细", range: "A1:M12", scale: 1.1, format: "png" });
     await fs.writeFile(path.join(qaDir, "BV汇总.png"), new Uint8Array(await summaryPreview.arrayBuffer()));
     await fs.writeFile(path.join(qaDir, "视频明细.png"), new Uint8Array(await detailPreview.arrayBuffer()));
     await fs.writeFile(path.join(qaDir, "inspect.txt"), `${summaryCheck.ndjson}\n${detailCheck.ndjson}\n${errors.ndjson}\n`, "utf8");

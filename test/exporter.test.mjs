@@ -7,7 +7,8 @@ import { FileBlob, SpreadsheetFile } from "@oai/artifact-tool";
 import { exportWorkbook } from "../src/exporter.mjs";
 
 const config = {
-  keywordGroups: [{ label: "AI" }],
+  keywordGroups: [{ label: "AI", queries: ["AI"] }],
+  contentPartitions: [{ name: "其他AI", fallback: true }],
   minViews: 10000,
   lookbackDays: 90,
 };
@@ -22,6 +23,7 @@ const rows = [
     author: "UP主",
     category: "科技",
     keywords: "AI",
+    matched_queries: "AI",
     first_qualified_at: Date.parse("2026-07-20T04:18:32Z") / 1000,
     last_checked_at: Date.parse("2026-07-20T04:18:32Z") / 1000,
     relevance_reason: "强关键词命中：AI",
@@ -47,10 +49,10 @@ test("Excel 和飞书导入使用原始 URL，不写入不兼容的 HYPERLINK �
     const detail = await workbook.inspect({
       kind: "table",
       sheetId: "视频明细",
-      range: "A3:K4",
+      range: "A3:M4",
       include: "values,formulas",
       tableMaxRows: 2,
-      tableMaxCols: 11,
+      tableMaxCols: 13,
       maxChars: 3000,
     });
     assert.match(summary.ndjson, /https:\/\/www\.bilibili\.com\/video\/BV1234567890/);
@@ -59,7 +61,8 @@ test("Excel 和飞书导入使用原始 URL，不写入不兼容的 HYPERLINK �
     const expectedChinaExcelSerial = (
       Date.UTC(2026, 6, 20, 12, 18, 32) - Date.UTC(1899, 11, 30)
     ) / 86400000;
-    assert.ok(Math.abs(detailValues[1][8] - expectedChinaExcelSerial) < 1e-9);
+    assert.equal(detailValues[1][3], "其他AI");
+    assert.ok(Math.abs(detailValues[1][10] - expectedChinaExcelSerial) < 1e-9);
     assert.doesNotMatch(`${summary.ndjson}\n${detail.ndjson}`, /HYPERLINK|formula/i);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
