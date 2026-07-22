@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { containsTerm, evaluateRelevance, flattenKeywordGroups, isWithinWindow, normalizeVideo, parsePlay, shouldSplitWindow } from "../src/core.mjs";
-import { buildScanUnits, isRateLimitError, shouldExportExcelAfterScan, splitWindowNewestFirst } from "../app.mjs";
+import { buildScanUnits, calculateRateLimitBlock, isRateLimitError, shouldExportExcelAfterScan, splitWindowNewestFirst } from "../app.mjs";
 import { buildPartitionDatasets, validateCollectorRules } from "../src/rules.mjs";
 
 const config = JSON.parse(await fs.readFile(new URL("../config.json", import.meta.url), "utf8"));
@@ -146,6 +146,43 @@ test("仅将B站412和v_voucher识别为可延期限流", () => {
   assert.equal(isRateLimitError(new Error("HTTP 412: request was banned")), true);
   assert.equal(isRateLimitError(new Error("B站接口返回结构异常 v_voucher")), true);
   assert.equal(isRateLimitError(new Error("HTTP 500")), false);
+});
+
+test("ClaudeCode 别名统一归入 Claude Code", () => {
+  const result = evaluateRelevance(
+    { title: "ClaudeCode 从入门到实战", tag: "AI编程", description: "" },
+    group("Claude Code"),
+    config,
+  );
+  assert.equal(result.accepted, true);
+  assert.equal(result.matchedQuery, "ClaudeCode");
+});
+
+test("首次412暂停12小时，48小时内再次触发暂停24小时", () => {
+  const cooldownConfig = {
+    rateLimitGlobalCooldownHours: 12,
+    rateLimitRepeatCooldownHours: 24,
+    rateLimitRepeatWindowHours: 48,
+  };
+  const first = calculateRateLimitBlock(1000, null, cooldownConfig);
+  assert.equal(first.repeated, false);
+  assert.equal(first.blockedUntil, 1000 + 12 * 3600);
+  const repeated = calculateRateLimitBlock(1000 + 24 * 3600, 1000, cooldownConfig);
+  assert.equal(repeated.repeated, true);
+  assert.equal(repeated.blockedUntil, 1000 + 48 * 3600);
+  const expired = calculateRateLimitBlock(1000 + 49 * 3600, 1000, cooldownConfig);
+  assert.equal(expired.repeated, false);
+  assert.equal(expired.blockedUntil, 1000 + 61 * 3600);
+});
+
+test("生产配置使用12小时计划任务对应的保守采集参数", () => {
+  assert.equal(config.incrementalOverlapHours, 14);
+  assert.deepEqual([config.requestDelayMinMs, config.requestDelayMaxMs], [30000, 45000]);
+  assert.deepEqual([config.keywordCooldownMinMs, config.keywordCooldownMaxMs], [90000, 150000]);
+  assert.equal(config.heavyKeywordRequestCount, 10);
+  assert.equal(config.heavyKeywordCooldownMs, 600000);
+  assert.equal(config.backfillUnitsPerCycle, 3);
+  assert.equal(config.maxConsecutiveRateLimitedUnits, 1);
 });
 
 test("自动采集默认不导出 Excel，飞书同步直接读取 SQLite", () => {

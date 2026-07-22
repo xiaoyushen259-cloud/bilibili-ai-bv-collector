@@ -67,6 +67,11 @@ export class CollectorDatabase {
         PRIMARY KEY (job_id, unit_index),
         FOREIGN KEY (job_id) REFERENCES scan_jobs(id) ON DELETE CASCADE
       );
+      CREATE TABLE IF NOT EXISTS runtime_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_videos_pubdate ON videos(pubdate);
       CREATE INDEX IF NOT EXISTS idx_videos_first_qualified ON videos(first_qualified_at);
       CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(mode, status, id);
@@ -79,6 +84,21 @@ export class CollectorDatabase {
 
   close() {
     this.db.close();
+  }
+
+  getRuntimeState(key) {
+    return this.db.prepare("SELECT value FROM runtime_state WHERE key=?").get(key)?.value ?? null;
+  }
+
+  setRuntimeState(key, value, nowTs = Math.floor(Date.now() / 1000)) {
+    this.db.prepare(`
+      INSERT INTO runtime_state(key,value,updated_at) VALUES(?,?,?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+    `).run(key, String(value), nowTs);
+  }
+
+  deleteRuntimeState(key) {
+    this.db.prepare("DELETE FROM runtime_state WHERE key=?").run(key);
   }
 
   beginRun(mode, nowTs) {
@@ -247,8 +267,15 @@ export class CollectorDatabase {
       WHERE ${clauses.join(" AND ")}
       ORDER BY v.first_qualified_at DESC, v.play DESC, v.bvid ASC
     `).all(...params);
-    const allowed = keywordGroups?.length
-      ? new Set(keywordGroups.map((label) => String(label).toLocaleLowerCase("en-US")))
+    const canonicalGroupByAlias = Array.isArray(keywordGroups)
+      ? new Map(keywordGroups.flatMap((group) => {
+        const label = typeof group === "string" ? group : group.label;
+        const aliases = typeof group === "string" ? [] : (group.legacyLabels ?? []);
+        return [label, ...aliases].map((alias) => [
+          String(alias).toLocaleLowerCase("en-US"),
+          String(label),
+        ]);
+      }))
       : null;
     return rows.map((row) => {
       const hits = String(row.keyword_hit_pairs ?? "").split(String.fromCharCode(30))
@@ -257,12 +284,16 @@ export class CollectorDatabase {
           const [keywordGroup, matchedQuery = ""] = pair.split(String.fromCharCode(31));
           return { keywordGroup, matchedQuery };
         })
-        .filter((hit) => !allowed || allowed.has(hit.keywordGroup.toLocaleLowerCase("en-US")));
-      if (allowed && !hits.length) return null;
+        .map((hit) => ({
+          ...hit,
+          canonicalGroup: canonicalGroupByAlias?.get(hit.keywordGroup.toLocaleLowerCase("en-US")) ?? null,
+        }))
+        .filter((hit) => !canonicalGroupByAlias || hit.canonicalGroup);
+      if (canonicalGroupByAlias && !hits.length) return null;
       const { keyword_hit_pairs: ignored, ...video } = row;
       return {
         ...video,
-        keywords: [...new Set(hits.map((hit) => hit.keywordGroup).filter(Boolean))].sort().join("、"),
+        keywords: [...new Set(hits.map((hit) => hit.canonicalGroup ?? hit.keywordGroup).filter(Boolean))].sort().join("、"),
         matched_queries: [...new Set(hits.map((hit) => hit.matchedQuery).filter(Boolean))].sort().join("、"),
       };
     }).filter(Boolean);

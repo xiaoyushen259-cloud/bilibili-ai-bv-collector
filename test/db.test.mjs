@@ -25,6 +25,13 @@ test("BV号去重且多关键词合并", () => {
   assert.equal(aiOnly[0].keywords, "AI");
   assert.equal(aiOnly[0].matched_queries, "AI");
   assert.equal(db.listVideos({ cutoffTs: 0, minViews: 10000, keywordGroups: ["不存在"] }).length, 0);
+  const renamed = db.listVideos({
+    cutoffTs: 0,
+    minViews: 10000,
+    keywordGroups: [{ label: "通用AI", legacyLabels: ["AI"] }],
+  });
+  assert.equal(renamed.length, 1);
+  assert.equal(renamed[0].keywords, "通用AI");
   db.close();
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
@@ -49,6 +56,23 @@ test("扫描任务断点和孤儿运行可恢复", () => {
   const run = db.db.prepare("SELECT status,finished_at FROM runs WHERE id=?").get(runId);
   assert.equal(run.status, "failed");
   assert.equal(run.finished_at, 1100);
+  db.close();
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test("412全局冷却状态可持久化、覆盖和清除", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "bv-db-runtime-state-test-"));
+  const dbPath = path.join(tempDir, "test.sqlite");
+  let db = new CollectorDatabase(dbPath);
+  db.setRuntimeState("bilibili_blocked_until", 2000, 1000);
+  assert.equal(db.getRuntimeState("bilibili_blocked_until"), "2000");
+  db.setRuntimeState("bilibili_blocked_until", 3000, 1100);
+  db.close();
+
+  db = new CollectorDatabase(dbPath);
+  assert.equal(db.getRuntimeState("bilibili_blocked_until"), "3000");
+  db.deleteRuntimeState("bilibili_blocked_until");
+  assert.equal(db.getRuntimeState("bilibili_blocked_until"), null);
   db.close();
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
