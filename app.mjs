@@ -19,6 +19,8 @@ const QA_DIR = path.join(ROOT, "qa");
 const DB_PATH = path.join(DATA_DIR, "collector.sqlite");
 const LOCK_PATH = path.join(DATA_DIR, "collector.lock");
 const FEISHU_CONFIG_PATH = path.join(DATA_DIR, "feishu-config.json");
+const BILIBILI_BLOCKED_UNTIL_KEY = "bilibili_blocked_until";
+const BILIBILI_LAST_RATE_LIMIT_AT_KEY = "bilibili_last_rate_limit_at";
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
@@ -174,7 +176,7 @@ export function shouldExportExcelAfterScan(config) {
 
 async function exportScope(db, config, scope, { qa = false } = {}) {
   const cutoffTs = nowSeconds() - config.lookbackDays * 86400;
-  const keywordGroups = activeKeywordGroups(config).map((group) => group.label);
+  const keywordGroups = activeKeywordGroups(config);
   if (scope === "master") {
     const rows = buildPartitionDatasets(
       db.listVideos({ cutoffTs, minViews: config.minViews, keywordGroups }),
@@ -213,6 +215,20 @@ async function exportScope(db, config, scope, { qa = false } = {}) {
 function isRateLimitError(error) {
   const text = `${String(error?.message ?? error)} ${String(error?.stdout ?? "")}`;
   return text.includes("v_voucher") || text.includes("-412") || text.includes("HTTP 412");
+}
+
+function calculateRateLimitBlock(nowTs, lastRateLimitAt, config) {
+  const repeatWindowSeconds = Number(config.rateLimitRepeatWindowHours ?? 48) * 3600;
+  const last = Number(lastRateLimitAt);
+  const repeated = Number.isFinite(last) && last > 0 && nowTs >= last && nowTs - last <= repeatWindowSeconds;
+  const cooldownHours = repeated
+    ? Number(config.rateLimitRepeatCooldownHours ?? 24)
+    : Number(config.rateLimitGlobalCooldownHours ?? 12);
+  return {
+    repeated,
+    cooldownHours,
+    blockedUntil: nowTs + Math.max(1, cooldownHours) * 3600,
+  };
 }
 
 async function executeScanUnit({ unit, index, totalUnits, mode, job, group, client, db, config, stats }) {
@@ -263,11 +279,20 @@ async function runScan(mode, { qa = false, maxUnits = Number.POSITIVE_INFINITY, 
   const releaseLock = await acquireLock(config);
   const db = new CollectorDatabase(DB_PATH);
   db.recoverOrphanedRuns(nowSeconds());
-  const client = new BilibiliClient(config);
   const stats = { requestCount: 0, qualifiedCount: 0, insertedCount: 0, updatedCount: 0 };
   let runId = null;
   let job;
+  let client = null;
   try {
+    const scanStartedAt = nowSeconds();
+    const blockedUntil = Number(db.getRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY) ?? 0);
+    if (blockedUntil > scanStartedAt) {
+      await log(`B站接口仍处于412冷却期，本次 ${mode} 扫描跳过；恢复时间 ${new Date(blockedUntil * 1000).toISOString()}`, "WARN");
+      return { skipped: true, rateLimited: true, blockedUntil, ...stats };
+    }
+    if (blockedUntil > 0) db.deleteRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY);
+
+    client = new BilibiliClient(config);
     const queries = flattenKeywordGroups(config);
     const expectedProgressKind = jobProgressKind(mode, config);
     job = db.getPendingJob(mode);
@@ -308,7 +333,19 @@ async function runScan(mode, { qa = false, maxUnits = Number.POSITIVE_INFINITY, 
         if (!isRateLimitError(error)) throw error;
         db.deferJobUnit(job.id, index, error);
         consecutiveRateLimits += 1;
-        await log(`扫描单元 ${index + 1}/${units.length} 因 412 被延期，不阻塞其他关键词：${unit.query}`, "WARN");
+        const limitedAt = nowSeconds();
+        const block = calculateRateLimitBlock(
+          limitedAt,
+          db.getRuntimeState(BILIBILI_LAST_RATE_LIMIT_AT_KEY),
+          config,
+        );
+        db.setRuntimeState(BILIBILI_LAST_RATE_LIMIT_AT_KEY, limitedAt, limitedAt);
+        db.setRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY, block.blockedUntil, limitedAt);
+        await log(
+          `扫描单元 ${index + 1}/${units.length} 因 412 被延期：${unit.query}；` +
+          `全部B站扫描暂停 ${block.cooldownHours} 小时，至 ${new Date(block.blockedUntil * 1000).toISOString()}`,
+          "WARN",
+        );
         return false;
       } finally {
         processedUnits += 1;
@@ -352,7 +389,7 @@ async function runScan(mode, { qa = false, maxUnits = Number.POSITIVE_INFINITY, 
     await log(`${mode} 扫描${outcome}：请求 ${stats.requestCount} 次，新收录 ${stats.insertedCount} 条，更新 ${stats.updatedCount} 次`);
     return { ...stats, completed, nextIndex, totalUnits: units.length };
   } catch (error) {
-    stats.requestCount = client.requestCount;
+    stats.requestCount = client?.requestCount ?? 0;
     if (job) db.failJob(job.id, error);
     if (runId !== null) db.finishRun(runId, stats, error);
     await log(error.stack ?? String(error), "ERROR");
@@ -384,7 +421,7 @@ async function qualifiedRowsSnapshot(config = null) {
     return db.listVideos({
       cutoffTs: nowSeconds() - activeConfig.lookbackDays * 86400,
       minViews: activeConfig.minViews,
-      keywordGroups: activeKeywordGroups(activeConfig).map((group) => group.label),
+      keywordGroups: activeKeywordGroups(activeConfig),
     });
   } finally {
     db.close();
@@ -464,6 +501,8 @@ async function doctor() {
   const config = await loadConfig();
   await ensureDirectories();
   const db = new CollectorDatabase(DB_PATH);
+  const blockedUntil = Number(db.getRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY) ?? 0);
+  const currentTs = nowSeconds();
   const checks = {
     node: process.version,
     platform: `${process.platform} ${process.arch}`,
@@ -475,10 +514,15 @@ async function doctor() {
     artifactTool: true,
     database: fsSync.existsSync(DB_PATH),
     schedulerCommand: process.platform === "win32" && fsSync.existsSync("C:\\Windows\\System32\\schtasks.exe"),
+    bilibiliRateLimit: {
+      blocked: blockedUntil > currentTs,
+      blockedUntil: blockedUntil > 0 ? blockedUntil : null,
+      blockedUntilIso: blockedUntil > 0 ? new Date(blockedUntil * 1000).toISOString() : null,
+    },
     stats: db.stats(
       nowSeconds() - config.lookbackDays * 86400,
       config.minViews,
-      activeKeywordGroups(config).map((group) => group.label),
+      activeKeywordGroups(config),
     ),
   };
   db.close();
@@ -498,7 +542,12 @@ async function main() {
   if (command === "scan") {
     const mode = readOption("--mode", "incremental");
     if (!["incremental", "full"].includes(mode)) throw new Error("--mode 仅支持 incremental 或 full");
-    return runScan(mode, { qa });
+    const maxUnitsOption = readOption("--max-units", null);
+    const maxUnits = maxUnitsOption === null ? Number.POSITIVE_INFINITY : Number(maxUnitsOption);
+    if (maxUnitsOption !== null && (!Number.isInteger(maxUnits) || maxUnits < 1)) {
+      throw new Error("--max-units 必须是正整数");
+    }
+    return runScan(mode, { qa, maxUnits });
   }
   if (command === "cycle") return runCycle({ qa });
   if (command === "feishu") return runFeishu(process.argv[3] ?? "preview");
@@ -523,6 +572,7 @@ if (path.resolve(process.argv[1] ?? "") === path.resolve(fileURLToPath(import.me
 
 export {
   buildScanUnits,
+  calculateRateLimitBlock,
   doctor,
   exportScope,
   isRateLimitError,
