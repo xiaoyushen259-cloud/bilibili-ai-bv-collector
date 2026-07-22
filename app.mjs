@@ -509,6 +509,12 @@ async function doctor() {
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     configuredTimezone: config.timezone,
     activeKeywordGroups: activeKeywordGroups(config).length,
+    bilibiliTransport: {
+      searchApi: "WBI",
+      cookieStorage: "process-memory-only",
+      requestIntervalMs: [config.requestDelayMinMs, config.requestDelayMaxMs],
+      collectionSchedule: "PT12H single task",
+    },
     partitioning: config.partitioning ?? null,
     config: fsSync.existsSync(CONFIG_PATH),
     artifactTool: true,

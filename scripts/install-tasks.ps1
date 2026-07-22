@@ -9,7 +9,8 @@ $nodePath = Join-Path $runtimeRoot 'bin\node.exe'
 $nodeModulesTarget = Join-Path $runtimeRoot 'node_modules'
 $nodeModulesLink = Join-Path $projectRoot 'node_modules'
 $appPath = Join-Path $projectRoot 'app.mjs'
-$taskNames = @('BVCollector-Incremental','BVCollector-Daily','BVCollector-Weekly')
+$taskNames = @('BVCollector-Incremental','BVCollector-Weekly')
+$legacyTaskNames = @('BVCollector-Daily')
 $existingEnabled = @{}
 foreach ($taskName in $taskNames) {
     $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -56,12 +57,18 @@ function Register-BVTask {
 $incrementalTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(12) `
     -RepetitionInterval (New-TimeSpan -Hours 12) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
-$dailyTrigger = New-ScheduledTaskTrigger -Daily -At '03:30'
 $weeklyTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '09:00'
 
 Register-BVTask -TaskName 'BVCollector-Incremental' -TaskArguments @('cycle') -Trigger $incrementalTrigger -Description 'Collect new videos and resume a bounded initial backfill batch every 12 hours.'
-Register-BVTask -TaskName 'BVCollector-Daily' -TaskArguments @('scan', '--mode', 'full', '--max-units', '3') -Trigger $dailyTrigger -Description 'Resume up to three rolling 90-day backfill units every day.'
 Register-BVTask -TaskName 'BVCollector-Weekly' -TaskArguments @('export', '--scope', 'weekly') -Trigger $weeklyTrigger -Description 'Export the previous completed week every Monday.'
+
+foreach ($legacyTaskName in $legacyTaskNames) {
+    $legacyTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+    if ($null -ne $legacyTask) {
+        Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false
+        Write-Host "Removed legacy scheduled task: $legacyTaskName"
+    }
+}
 
 foreach ($taskName in $taskNames) {
     if ($existingEnabled.ContainsKey($taskName) -and -not $existingEnabled[$taskName]) {
@@ -69,7 +76,7 @@ foreach ($taskName in $taskNames) {
     }
 }
 
-Get-ScheduledTask -TaskName 'BVCollector-Incremental','BVCollector-Daily','BVCollector-Weekly' |
+Get-ScheduledTask -TaskName 'BVCollector-Incremental','BVCollector-Weekly' |
     Select-Object TaskName, State, Description |
     Format-Table -AutoSize
 

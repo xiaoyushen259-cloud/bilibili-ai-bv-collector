@@ -185,6 +185,14 @@ test("生产配置使用12小时计划任务对应的保守采集参数", () => 
   assert.equal(config.maxConsecutiveRateLimitedUnits, 1);
 });
 
+test("计划任务只保留一个每12小时运行的B站采集入口", async () => {
+  const script = await fs.readFile(new URL("../scripts/install-tasks.ps1", import.meta.url), "utf8");
+  assert.match(script, /New-TimeSpan -Hours 12/);
+  assert.match(script, /Register-BVTask -TaskName 'BVCollector-Incremental' -TaskArguments @\('cycle'\)/);
+  assert.doesNotMatch(script, /Register-BVTask -TaskName 'BVCollector-Daily'/);
+  assert.match(script, /Unregister-ScheduledTask -TaskName \$legacyTaskName/);
+});
+
 test("自动采集默认不导出 Excel，飞书同步直接读取 SQLite", () => {
   assert.equal(shouldExportExcelAfterScan({}), false);
   assert.equal(shouldExportExcelAfterScan({ excelExportAfterScan: false }), false);
