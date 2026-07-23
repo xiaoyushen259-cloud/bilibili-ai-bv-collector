@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { parsePlay, shouldSplitWindow } from "./core.mjs";
 
 const HOME_URL = "https://www.bilibili.com/";
+const SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi";
 const NAV_URL = "https://api.bilibili.com/x/web-interface/nav";
 const SEARCH_URL = "https://api.bilibili.com/x/web-interface/wbi/search/type";
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -142,8 +143,16 @@ export class BilibiliClient {
   async ensureAnonymousSession() {
     if (this.sessionReady) return;
     await this.request(HOME_URL, { document: true });
+    const fingerprint = await this.requestJson(SPI_URL);
+    if (fingerprint?.code === 0 && fingerprint?.data?.b_3) {
+      this.cookies.set("buvid3", fingerprint.data.b_3);
+    }
+    if (fingerprint?.code === 0 && fingerprint?.data?.b_4) {
+      this.cookies.set("buvid4", fingerprint.data.b_4);
+    }
+    this.cookies.set("CURRENT_FNVAL", "4048");
     if (!this.cookies.has("buvid3")) {
-      const error = new Error("B站匿名会话未返回 buvid3 Cookie，已停止请求且不会尝试绕过验证");
+      const error = new Error("B站匿名会话未返回 buvid3 标识，已停止请求且不会尝试绕过验证");
       error.noRetry = true;
       throw error;
     }
@@ -154,12 +163,16 @@ export class BilibiliClient {
     if (this.wbiKeys && !refresh) return this.wbiKeys;
     await this.ensureAnonymousSession();
     const payload = await this.requestJson(NAV_URL);
-    if (payload?.code !== 0) throw new Error(`B站导航接口错误 ${payload?.code}: ${payload?.message ?? "未知错误"}`);
     const imgUrl = payload?.data?.wbi_img?.img_url;
     const subUrl = payload?.data?.wbi_img?.sub_url;
     const imgKey = imgUrl?.split("/").pop()?.split(".")[0];
     const subKey = subUrl?.split("/").pop()?.split(".")[0];
-    if (!imgKey || !subKey) throw new Error("B站导航接口缺少 WBI 图片密钥");
+    if (!imgKey || !subKey) {
+      if (payload?.code !== 0) {
+        throw new Error(`B站导航接口错误 ${payload?.code}: ${payload?.message ?? "未知错误"}；且缺少 WBI 图片密钥`);
+      }
+      throw new Error("B站导航接口缺少 WBI 图片密钥");
+    }
     this.wbiKeys = { imgKey, subKey };
     return this.wbiKeys;
   }
