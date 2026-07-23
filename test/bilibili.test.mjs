@@ -20,6 +20,15 @@ function mockBilibili(searchHandler, calls = []) {
     if (parsed.hostname === "www.bilibili.com") {
       return response("<html></html>", 200, ["buvid3=anonymous-test-id; Path=/; Domain=.bilibili.com", "b_nut=1; Path=/"]);
     }
+    if (parsed.pathname === "/x/frontend/finger/spi") {
+      return response({
+        code: 0,
+        data: {
+          b_3: "spi-anonymous-test-id",
+          b_4: "spi-anonymous-test-id-4",
+        },
+      });
+    }
     if (parsed.pathname === "/x/web-interface/nav") {
       return response({
         code: 0,
@@ -157,33 +166,91 @@ test("匿名 Cookie 仅在进程内传给 WBI 导航和搜索请求", async () =
   });
   await client.search({ keyword: "Claude Code", order: "click", page: 1, startTs: 1, endTs: 2 });
 
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
   assert.equal(calls[0].url.pathname, "/");
-  assert.equal(calls[1].url.pathname, "/x/web-interface/nav");
-  assert.equal(calls[2].url.pathname, "/x/web-interface/wbi/search/type");
-  assert.match(calls[1].options.headers.Cookie, /buvid3=anonymous-test-id/);
-  assert.match(calls[2].options.headers.Cookie, /buvid3=anonymous-test-id/);
-  assert.match(calls[2].options.headers["User-Agent"], /Chrome\/136/);
-  assert.equal(calls[2].options.headers.Referer, "https://search.bilibili.com/");
-  assert.equal(calls[2].url.searchParams.get("wts"), "1702204169");
-  assert.match(calls[2].url.searchParams.get("w_rid"), /^[0-9a-f]{32}$/);
-  assert.equal(client.requestCount, 3);
+  assert.equal(calls[1].url.pathname, "/x/frontend/finger/spi");
+  assert.equal(calls[2].url.pathname, "/x/web-interface/nav");
+  assert.equal(calls[3].url.pathname, "/x/web-interface/wbi/search/type");
+  assert.match(calls[2].options.headers.Cookie, /buvid3=spi-anonymous-test-id/);
+  assert.match(calls[2].options.headers.Cookie, /buvid4=spi-anonymous-test-id-4/);
+  assert.match(calls[3].options.headers.Cookie, /buvid3=spi-anonymous-test-id/);
+  assert.match(calls[3].options.headers["User-Agent"], /Chrome\/136/);
+  assert.equal(calls[3].options.headers.Referer, "https://search.bilibili.com/");
+  assert.equal(calls[3].url.searchParams.get("wts"), "1702204169");
+  assert.match(calls[3].url.searchParams.get("w_rid"), /^[0-9a-f]{32}$/);
+  assert.equal(client.requestCount, 4);
 });
 
-test("匿名首页未返回 buvid3 时停止，不继续请求 WBI 接口", async () => {
+test("匿名导航返回 -101 但包含 WBI 密钥时仍可搜索", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const parsed = new URL(url);
+    calls.push({ url: parsed, options });
+    if (parsed.hostname === "www.bilibili.com") {
+      return response("<html></html>", 200, ["buvid3=anonymous-test-id; Path=/; Domain=.bilibili.com"]);
+    }
+    if (parsed.pathname === "/x/frontend/finger/spi") {
+      return response({
+        code: 0,
+        data: {
+          b_3: "spi-anonymous-test-id",
+          b_4: "spi-anonymous-test-id-4",
+        },
+      });
+    }
+    if (parsed.pathname === "/x/web-interface/nav") {
+      return response({
+        code: -101,
+        message: "账号未登录",
+        data: {
+          isLogin: false,
+          wbi_img: {
+            img_url: "https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png",
+            sub_url: "https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png",
+          },
+        },
+      });
+    }
+    return response({ code: 0, data: { result: [], numPages: 0, numResults: 0 } });
+  };
+  const client = new BilibiliClient(baseConfig, {
+    fetchImpl,
+    sleepImpl: async () => {},
+    random: () => 0,
+    nowImpl: () => 1702204169000,
+  });
+
+  const result = await client.search({
+    keyword: "agent",
+    order: "click",
+    page: 1,
+    startTs: 1,
+    endTs: 2,
+  });
+
+  assert.deepEqual(result.items, []);
+  assert.equal(calls.length, 4);
+  assert.equal(calls[2].url.pathname, "/x/web-interface/nav");
+  assert.equal(calls[3].url.pathname, "/x/web-interface/wbi/search/type");
+});
+
+test("首页与匿名指纹接口都未返回 buvid3 时停止，不继续请求 WBI 接口", async () => {
   let calls = 0;
   const client = new BilibiliClient(baseConfig, {
-    fetchImpl: async () => {
+    fetchImpl: async (url) => {
       calls += 1;
+      if (new URL(url).pathname === "/x/frontend/finger/spi") {
+        return response({ code: 0, data: {} });
+      }
       return response("<html></html>");
     },
     sleepImpl: async () => {},
   });
   await assert.rejects(
     client.search({ keyword: "AI", order: "click", page: 1, startTs: 1, endTs: 2 }),
-    /未返回 buvid3 Cookie/,
+    /未返回 buvid3/,
   );
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
 });
 
 test("WBI fetch 的 HTML 412 会原样交给全局长冷却逻辑", async () => {
