@@ -90,33 +90,36 @@ B站返回 `412` 或 `v_voucher` 时，当前扫描会保留到“关键词 + 7 
 
 ```json
 {
-  "label": "seedance2.0",
-  "queries": ["seedance2.0", "Seedance 2.0", "Seedance2.0"],
-  "matchTerms": ["seedance2.0", "Seedance 2.0", "Seedance2.0"],
-  "ambiguous": false,
-  "partitionName": "Seedance2.0分区",
-  "mergeInto": "AI视频分区"
+  "label": "ComfyUI-Flux",
+  "queries": ["ComfyUI Flux"],
+  "matchTerms": ["FLUX.1", "Flux"],
+  "requiredContextTerms": ["ComfyUI"],
+  "ambiguous": false
 }
 ```
 
 - `queries`：用于调用 B站搜索接口，可以配置多个别名。
 - `matchTerms`：标题、简介或标签中必须实际出现的词；不填写时默认使用 `queries`。
+- `requiredContextTerms`：配置后，标题、简介或标签还必须至少出现一个课程上下文词；适合过滤 `Flux`、`龙虾`、`Grok` 等容易产生歧义的细分词。
 - `ambiguous`：设为 `true` 时，命中词还必须同时出现 AI 上下文，适合 `AI`、`MJ`、`discord` 等歧义词。
 - `enabled`：设为 `false` 可暂停该关键词组；省略时默认启用。停用后，只命中该组的历史视频也不会继续出现在当前飞书结果中。
 - `legacyLabels`：旧版本使用过的关键词组名称；重新命名后可把 SQLite 中的历史命中统一归入新名称。
-- `partitionName`：该关键词达到独立分区门槛时使用的工作表名称。
-- `mergeInto`：不足门槛时并入的相关关键词组或相关分区名称。
+- `contentPartitions`：把细分关键词组固定映射到对应课程工作表。
+- `managedPartitionNames`：记录旧版创建过的分区名称；同步成功后会删除不再使用的旧工作表。
 
-`partitioning.minStandaloneVideos` 控制独立分区门槛，默认是 50 条：
+生产配置固定使用五个课程工作表，不再根据视频数量把细分关键词拆成额外分区：
 
 ```json
-{
-  "minStandaloneVideos": 50,
-  "fallbackPartition": "其他AI"
-}
+[
+  { "name": "Midjourney", "keywordGroups": ["midjourney", "MJ", "niji"] },
+  { "name": "ComfyUI", "keywordGroups": ["comfyui", "ComfyUI-Flux", "ComfyUI-LTX"] },
+  { "name": "Agent", "keywordGroups": ["agent", "codex", "coze", "扣子", "Claude Code", "OpenClaw", "龙虾", "MCP"] },
+  { "name": "AI视频", "keywordGroups": ["Seedance", "Kling", "Grok视频", "Sora", "Veo"] },
+  { "name": "WebUI", "keywordGroups": ["Stable Diffusion WebUI", "AUTOMATIC1111", "Forge"] }
+]
 ```
 
-达到 50 条的关键词自动使用自己的 `partitionName`；不足 50 条时自动并入 `mergeInto` 指定的相关分区。同一视频可以进入多个分区。修改规则后，历史视频会依据 SQLite 中已有的关键词记录立即重新分类，无需重新抓取。
+细分关键词仍保存在“关键词组”和“实际命中关键词”列中，因此可以继续区分课程内的具体课题。同一视频可以进入多个课程分区。修改规则后，已有关键词命中的历史视频会立即重新分类；新增加的细分关键词需要后续扫描才能补齐。
 
 ## 同步到飞书电子表格
 

@@ -27,28 +27,47 @@
   "logRetentionDays": 30,
   "excelExportAfterScan": false,
   "keywordGroups": [
-    { "label": "agent", "queries": ["agent"], "matchTerms": ["agent"], "ambiguous": true, "partitionName": "Agent分区", "mergeInto": "Agent相关分区" },
-    { "label": "AI", "queries": ["AI"], "matchTerms": ["AI"], "ambiguous": true, "partitionName": "AI分区", "mergeInto": "综合AI分区" },
-    { "label": "codex", "queries": ["codex"], "matchTerms": ["codex"], "ambiguous": false, "partitionName": "Codex分区", "mergeInto": "agent" },
-    { "label": "coze", "queries": ["coze"], "matchTerms": ["coze"], "ambiguous": false, "partitionName": "Coze分区", "mergeInto": "agent" },
-    { "label": "扣子", "queries": ["扣子"], "matchTerms": ["扣子"], "ambiguous": true, "partitionName": "扣子分区", "mergeInto": "agent" },
-    { "label": "openclaw", "queries": ["openclaw"], "matchTerms": ["openclaw"], "ambiguous": false, "partitionName": "OpenClaw分区", "mergeInto": "agent" },
-    { "label": "龙虾", "queries": ["龙虾"], "matchTerms": ["龙虾"], "ambiguous": true, "partitionName": "龙虾分区", "mergeInto": "agent" },
-    { "label": "Hermes", "queries": ["Hermes"], "matchTerms": ["Hermes"], "ambiguous": true, "partitionName": "Hermes分区", "mergeInto": "agent" },
-    { "label": "Claude Code", "legacyLabels": ["cloudecode"], "queries": ["Claude Code", "ClaudeCode"], "matchTerms": ["Claude Code", "ClaudeCode"], "ambiguous": false, "partitionName": "Claude Code分区", "mergeInto": "agent" },
-    { "label": "GPT", "queries": ["GPT"], "matchTerms": ["GPT"], "ambiguous": false, "partitionName": "GPT分区", "mergeInto": "综合AI分区" },
-    { "label": "comfyui", "queries": ["comfyui"], "matchTerms": ["comfyui"], "ambiguous": false, "partitionName": "ComfyUI分区", "mergeInto": "AI绘画分区" },
-    { "label": "MJ", "queries": ["MJ"], "matchTerms": ["MJ"], "ambiguous": true, "partitionName": "MJ分区", "mergeInto": "AI绘画分区" },
-    { "label": "midjourney", "queries": ["midjourney"], "matchTerms": ["midjourney"], "ambiguous": false, "partitionName": "Midjourney分区", "mergeInto": "AI绘画分区" },
-    { "label": "discord", "queries": ["discord"], "matchTerms": ["discord"], "ambiguous": true, "partitionName": "Discord分区", "mergeInto": "综合AI分区" },
-    { "label": "seedance2.0", "queries": ["seedance2.0", "Seedance 2.0", "Seedance2.0"], "matchTerms": ["seedance2.0", "Seedance 2.0", "Seedance2.0"], "ambiguous": false, "partitionName": "Seedance2.0分区", "mergeInto": "AI视频分区" },
-    { "label": "stablediffusion", "queries": ["stablediffusion"], "matchTerms": ["stablediffusion", "Stable Diffusion"], "ambiguous": false, "partitionName": "Stable Diffusion分区", "mergeInto": "AI绘画分区" }
+    { "label": "midjourney", "queries": ["midjourney"], "matchTerms": ["midjourney"], "ambiguous": false },
+    { "label": "MJ", "queries": ["MJ"], "matchTerms": ["MJ"], "ambiguous": true },
+    { "label": "niji", "queries": ["Niji Journey"], "matchTerms": ["Niji Journey", "Niji"], "ambiguous": false },
+
+    { "label": "comfyui", "queries": ["comfyui"], "matchTerms": ["comfyui"], "ambiguous": false },
+    { "label": "ComfyUI-Flux", "queries": ["ComfyUI Flux"], "matchTerms": ["FLUX.1", "Flux"], "requiredContextTerms": ["ComfyUI"], "ambiguous": false },
+    { "label": "ComfyUI-LTX", "queries": ["ComfyUI LTX"], "matchTerms": ["LTX-Video", "LTX Video", "LTXV", "LTX"], "requiredContextTerms": ["ComfyUI"], "ambiguous": false },
+
+    { "label": "agent", "queries": ["AI Agent"], "matchTerms": ["AI Agent", "Agent", "智能体"], "requiredContextTerms": ["AI", "人工智能", "智能体", "大模型", "LLM", "Codex", "Claude", "Coze", "扣子", "MCP"], "ambiguous": false },
+    { "label": "codex", "queries": ["codex"], "matchTerms": ["codex"], "ambiguous": false },
+    { "label": "coze", "queries": ["coze"], "matchTerms": ["coze"], "ambiguous": false },
+    { "label": "扣子", "queries": ["扣子 AI"], "matchTerms": ["扣子"], "requiredContextTerms": ["AI", "人工智能", "智能体", "Agent", "Coze"], "ambiguous": false },
+    { "label": "Claude Code", "legacyLabels": ["cloudecode"], "queries": ["Claude Code"], "matchTerms": ["Claude Code", "ClaudeCode"], "ambiguous": false },
+    { "label": "OpenClaw", "legacyLabels": ["openclaw"], "queries": ["OpenClaw"], "matchTerms": ["OpenClaw", "Open Claw"], "ambiguous": false },
+    { "label": "龙虾", "queries": ["龙虾 AI"], "matchTerms": ["龙虾"], "requiredContextTerms": ["AI", "人工智能", "智能体", "Agent", "OpenClaw", "Open Claw"], "ambiguous": false },
+    { "label": "MCP", "queries": ["MCP AI"], "matchTerms": ["MCP"], "requiredContextTerms": ["AI", "人工智能", "Agent", "智能体", "大模型", "LLM", "Claude", "Codex"], "ambiguous": false },
+
+    { "label": "Seedance", "legacyLabels": ["seedance2.0"], "queries": ["Seedance"], "matchTerms": ["Seedance 2.0", "Seedance2.0", "Seedance"], "ambiguous": false },
+    { "label": "Kling", "queries": ["Kling AI视频", "可灵 AI视频"], "matchTerms": ["Kling", "可灵"], "requiredContextTerms": ["AI视频", "视频", "Video", "文生视频", "图生视频", "视频生成"], "ambiguous": false },
+    { "label": "Grok视频", "queries": ["Grok 视频"], "matchTerms": ["Grok Imagine", "Grok"], "requiredContextTerms": ["Imagine", "AI视频", "视频", "Video", "文生视频", "图生视频"], "ambiguous": false },
+    { "label": "Sora", "queries": ["Sora 视频"], "matchTerms": ["Sora"], "requiredContextTerms": ["AI视频", "视频", "Video", "文生视频", "图生视频"], "ambiguous": false },
+    { "label": "Veo", "queries": ["Veo 视频"], "matchTerms": ["Veo 3", "Veo 2", "Veo"], "requiredContextTerms": ["AI视频", "视频", "Video", "文生视频", "图生视频"], "ambiguous": false },
+
+    { "label": "Stable Diffusion WebUI", "queries": ["Stable Diffusion WebUI"], "matchTerms": ["Stable Diffusion"], "requiredContextTerms": ["WebUI", "AUTOMATIC1111", "A1111", "Forge"], "ambiguous": false },
+    { "label": "AUTOMATIC1111", "queries": ["AUTOMATIC1111"], "matchTerms": ["AUTOMATIC1111", "A1111"], "ambiguous": false },
+    { "label": "Forge", "queries": ["Stable Diffusion WebUI Forge"], "matchTerms": ["Forge"], "requiredContextTerms": ["Stable Diffusion", "WebUI"], "ambiguous": false }
   ],
-  "partitioning": {
-    "minStandaloneVideos": 50,
-    "fallbackPartition": "其他AI",
-    "managedPartitionNames": ["SD分区", "其他AI"]
-  },
+  "contentPartitions": [
+    { "name": "Midjourney", "keywordGroups": ["midjourney", "MJ", "niji"] },
+    { "name": "ComfyUI", "keywordGroups": ["comfyui", "ComfyUI-Flux", "ComfyUI-LTX"] },
+    { "name": "Agent", "keywordGroups": ["agent", "codex", "coze", "扣子", "Claude Code", "OpenClaw", "龙虾", "MCP"] },
+    { "name": "AI视频", "keywordGroups": ["Seedance", "Kling", "Grok视频", "Sora", "Veo"] },
+    { "name": "WebUI", "keywordGroups": ["Stable Diffusion WebUI", "AUTOMATIC1111", "Forge"] }
+  ],
+  "managedPartitionNames": [
+    "Agent分区", "Agent相关分区", "AI分区", "综合AI分区", "Codex分区", "Coze分区",
+    "扣子分区", "OpenClaw分区", "龙虾分区", "Hermes分区", "Claude Code分区",
+    "GPT分区", "ComfyUI分区", "MJ分区", "Midjourney分区", "Discord分区",
+    "Seedance2.0分区", "Stable Diffusion分区", "AI绘画分区", "AI视频分区",
+    "SD分区", "其他AI"
+  ],
   "aiContextTerms": [
     "人工智能", "AIGC", "LLM", "大模型", "生成式", "生成", "模型", "智能体",
     "提示词", "工作流", "机器人", "聊天机器人", "文生图", "图生图", "文生视频",
