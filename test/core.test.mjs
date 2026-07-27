@@ -2,7 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { containsTerm, evaluateRelevance, flattenKeywordGroups, isWithinWindow, normalizeVideo, parsePlay, shouldSplitWindow } from "../src/core.mjs";
-import { buildScanUnits, calculateRateLimitBlock, isRateLimitError, shouldExportExcelAfterScan, splitWindowNewestFirst } from "../app.mjs";
+import {
+  buildScanUnits,
+  calculateRateLimitBlock,
+  isRateLimitError,
+  randomizeQueriesForSegment,
+  shouldExportExcelAfterScan,
+  splitWindowNewestFirst,
+} from "../app.mjs";
 import { buildPartitionDatasets, validateCollectorRules } from "../src/rules.mjs";
 
 const config = JSON.parse(await fs.readFile(new URL("../config.json", import.meta.url), "utf8"));
@@ -111,7 +118,7 @@ test("仅在接口饱和且末页仍全部达标时拆分", () => {
   assert.equal(shouldSplitWindow({ numPages: 50, lastPageItems: [{ play: 9999 }], minViews: 10000, startTs: 0, endTs: 3600, minSplitMinutes: 5, depth: 0, maxSplitDepth: 18 }), false);
 });
 
-test("全量扫描按最新到最旧的24小时时间片建立可恢复单元", () => {
+test("全量扫描按最新到最旧的24小时时间片建立可恢复随机单元", () => {
   const segments = splitWindowNewestFirst(0, 172800, 24);
   assert.deepEqual(segments, [
     { startTs: 86401, endTs: 172800 },
@@ -125,7 +132,40 @@ test("全量扫描按最新到最旧的24小时时间片建立可恢复单元", 
     { fullSegmentHours: 24 },
   );
   assert.equal(units.length, 6);
-  assert.deepEqual(units.map((unit) => unit.query), ["AI", "GPT", "AI", "GPT", "AI", "GPT"]);
+  for (let segmentIndex = 0; segmentIndex < 3; segmentIndex += 1) {
+    const segmentQueries = units
+      .filter((unit) => unit.segmentIndex === segmentIndex)
+      .map((unit) => unit.query)
+      .sort();
+    assert.deepEqual(segmentQueries, ["AI", "GPT"]);
+  }
+});
+
+test("同一时间片的关键词组顺序稳定随机且组内别名连续不重复", () => {
+  const queries = [
+    { label: "agent", query: "agent" },
+    { label: "Claude Code", query: "Claude Code" },
+    { label: "Claude Code", query: "ClaudeCode" },
+    { label: "GPT", query: "GPT" },
+    { label: "comfyui", query: "comfyui" },
+    { label: "midjourney", query: "midjourney" },
+  ];
+  const job = { id: 42, start_ts: 0, end_ts: 172800 };
+  const newest = { startTs: 86401, endTs: 172800 };
+  const older = { startTs: 1, endTs: 86400 };
+
+  const firstOrder = randomizeQueriesForSegment(queries, job, newest, 0);
+  const resumedOrder = randomizeQueriesForSegment(queries, job, newest, 0);
+  const nextSegmentOrder = randomizeQueriesForSegment(queries, job, older, 1);
+
+  assert.deepEqual(resumedOrder, firstOrder);
+  assert.notDeepEqual(nextSegmentOrder, firstOrder);
+  assert.deepEqual(
+    firstOrder.map((entry) => entry.query).sort(),
+    queries.map((entry) => entry.query).sort(),
+  );
+  const claudeIndex = firstOrder.findIndex((entry) => entry.query === "Claude Code");
+  assert.equal(firstOrder[claudeIndex + 1].query, "ClaudeCode");
 });
 
 test("生产配置的90天窗口按7天片段压缩主扫描单元", () => {
