@@ -27,6 +27,10 @@ export function matchTermsForGroup(group) {
   return configured.length ? configured : normalizedList(group.queries);
 }
 
+export function requiredContextTermsForGroup(group) {
+  return normalizedList(group.requiredContextTerms);
+}
+
 export function validateCollectorRules(config) {
   const labels = new Set();
   for (const group of activeKeywordGroups(config)) {
@@ -50,6 +54,9 @@ export function validateCollectorRules(config) {
       validateSheetTitle(name, "managedPartitionNames 中的名称");
     }
   }
+  for (const name of normalizedList(config.managedPartitionNames)) {
+    validateSheetTitle(name, "managedPartitionNames 中的名称");
+  }
 
   const partitionNames = new Set();
   let fallbackCount = 0;
@@ -67,6 +74,11 @@ export function validateCollectorRules(config) {
       && !normalizedList(partition.keywordGroups).length
       && !normalizedList(partition.matchTerms).length) {
       throw new Error(`内容分区“${name}”必须配置 keywordGroups、matchTerms 或 fallback`);
+    }
+    for (const groupLabel of normalizedList(partition.keywordGroups)) {
+      if (!labels.has(groupLabel.toLocaleLowerCase("en-US"))) {
+        throw new Error(`内容分区“${name}”引用了不存在或已停用的关键词组：${groupLabel}`);
+      }
     }
   }
   if (fallbackCount > 1) throw new Error("contentPartitions 最多只能配置一个 fallback 分区");
@@ -105,7 +117,10 @@ export function buildPartitionDatasets(rows, config) {
   return {
     rows: enrichedRows,
     partitions,
-    managedPartitionNames: partitions.map((partition) => partition.name),
+    managedPartitionNames: [...new Set([
+      ...partitions.map((partition) => partition.name),
+      ...normalizedList(config.managedPartitionNames),
+    ])],
   };
 }
 

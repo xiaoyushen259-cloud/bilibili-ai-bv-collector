@@ -46,10 +46,27 @@ test("SD 与 AI 上下文共同命中时通过", () => {
   assert.equal(result.accepted, true);
 });
 
-test("Seedance 2.0 别名统一归入 seedance2.0", () => {
-  const result = evaluateRelevance({ title: "Seedance 2.0 视频生成实战", tag: "AI视频", description: "" }, group("seedance2.0"), config);
+test("Seedance 2.0 别名统一归入 Seedance", () => {
+  const result = evaluateRelevance({ title: "Seedance 2.0 视频生成实战", tag: "AI视频", description: "" }, group("Seedance"), config);
   assert.equal(result.accepted, true);
   assert.equal(result.matchedQuery, "Seedance 2.0");
+});
+
+test("细分关键词必须同时出现配置的课程上下文", () => {
+  const comfyFlux = group("ComfyUI-Flux");
+  const unrelated = evaluateRelevance(
+    { title: "Flux 建筑焊接工艺", tag: "工业", description: "" },
+    comfyFlux,
+    config,
+  );
+  const relevant = evaluateRelevance(
+    { title: "ComfyUI Flux.1 工作流完整教程", tag: "AI绘画", description: "" },
+    comfyFlux,
+    config,
+  );
+  assert.equal(unrelated.accepted, false);
+  assert.match(unrelated.reason, /缺少课程上下文/);
+  assert.equal(relevant.accepted, true);
 });
 
 test("搜索词与视频实际命中词可分别配置，并可停用关键词组", () => {
@@ -63,6 +80,41 @@ test("搜索词与视频实际命中词可分别配置，并可停用关键词�
   assert.equal(evaluateRelevance({ title: "正文命中词教程" }, customConfig.keywordGroups[0], customConfig).accepted, true);
   assert.equal(evaluateRelevance({ title: "只有搜索用词" }, customConfig.keywordGroups[0], customConfig).accepted, false);
   assert.deepEqual(flattenKeywordGroups(customConfig).map((entry) => entry.query), ["搜索用词"]);
+});
+
+test("生产配置固定映射为五门课程且每个细分组都有归属", () => {
+  validateCollectorRules(config);
+  assert.deepEqual(
+    config.contentPartitions.map((partition) => partition.name),
+    ["Midjourney", "ComfyUI", "Agent", "AI视频", "WebUI"],
+  );
+  const mappedGroups = new Set(config.contentPartitions.flatMap((partition) => partition.keywordGroups));
+  assert.deepEqual(
+    config.keywordGroups.map((entry) => entry.label).filter((label) => !mappedGroups.has(label)),
+    [],
+  );
+  assert.equal(flattenKeywordGroups(config).length, 23);
+
+  const result = buildPartitionDatasets([
+    { bvid: "BV1234567890", keywords: "ComfyUI-Flux", matched_queries: "Flux" },
+    { bvid: "BV1234567891", keywords: "codex", matched_queries: "codex" },
+    { bvid: "BV1234567892", keywords: "Grok视频", matched_queries: "Grok" },
+    { bvid: "BV1234567893", keywords: "Forge", matched_queries: "Forge" },
+    { bvid: "BV1234567894", keywords: "niji", matched_queries: "Niji" },
+  ], config);
+  assert.deepEqual(
+    result.rows.map((row) => row.content_partitions),
+    ["ComfyUI", "Agent", "AI视频", "WebUI", "Midjourney"],
+  );
+  assert.equal(result.partitions.length, 5);
+  assert.ok(result.managedPartitionNames.includes("Codex分区"));
+});
+
+test("固定课程分区不能引用不存在的细分关键词组", () => {
+  assert.throws(() => validateCollectorRules({
+    keywordGroups: [{ label: "codex", queries: ["codex"] }],
+    contentPartitions: [{ name: "Agent", keywordGroups: ["codex", "不存在"] }],
+  }), /引用了不存在或已停用的关键词组/);
 });
 
 test("视频可进入多个内容分区，未命中分区规则时进入兜底分区", () => {

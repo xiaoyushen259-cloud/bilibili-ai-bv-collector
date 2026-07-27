@@ -1,4 +1,4 @@
-import { activeKeywordGroups, matchTermsForGroup } from "./rules.mjs";
+import { activeKeywordGroups, matchTermsForGroup, requiredContextTermsForGroup } from "./rules.mjs";
 
 const AMBIGUOUS_BOUNDARY_TERMS = new Set(["ai", "mj", "sd"]);
 
@@ -52,6 +52,17 @@ export function evaluateRelevance(item, group, config) {
   const matchedQuery = matchTermsForGroup(group).find((query) => containsTerm(text, query));
   if (!matchedQuery) {
     return { accepted: false, reason: `搜索结果正文未直接出现关键词组“${group.label}”` };
+  }
+  const requiredContextTerms = requiredContextTermsForGroup(group);
+  if (requiredContextTerms.length) {
+    const requiredContext = requiredContextTerms.find((term) => containsTerm(text, term));
+    if (!requiredContext) {
+      return {
+        accepted: false,
+        reason: `关键词“${matchedQuery}”缺少课程上下文：${requiredContextTerms.join("、")}`,
+        matchedQuery,
+      };
+    }
   }
   if (!group.ambiguous) {
     return { accepted: true, reason: `强关键词命中：${matchedQuery}`, matchedQuery };
