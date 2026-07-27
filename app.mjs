@@ -138,14 +138,41 @@ function splitWindowNewestFirst(startTs, endTs, segmentHours) {
   return segments;
 }
 
+function randomizeQueriesForSegment(queries, job, segment, segmentIndex) {
+  const groups = new Map();
+  for (const query of queries) {
+    const key = String(query.label);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(query);
+  }
+
+  const seed = [
+    job.id ?? "pending",
+    job.start_ts,
+    job.end_ts,
+    segmentIndex,
+    segment.startTs,
+    segment.endTs,
+  ].join(":");
+
+  return [...groups.entries()]
+    .map(([label, groupQueries], originalIndex) => ({
+      groupQueries,
+      originalIndex,
+      rank: createHash("sha256").update(`${seed}:${label}`).digest().readUInt32BE(0),
+    }))
+    .sort((left, right) => left.rank - right.rank || left.originalIndex - right.originalIndex)
+    .flatMap((entry) => entry.groupQueries);
+}
+
 function buildScanUnits(mode, queries, job, config) {
   if (mode === "incremental") {
-    return queries.map((query, queryIndex) => ({
+    const segment = { startTs: Number(job.start_ts), endTs: Number(job.end_ts) };
+    return randomizeQueriesForSegment(queries, job, segment, 0).map((query, queryIndex) => ({
       ...query,
       queryIndex,
       segmentIndex: 0,
-      startTs: Number(job.start_ts),
-      endTs: Number(job.end_ts),
+      ...segment,
     }));
   }
   const segments = splitWindowNewestFirst(
@@ -153,12 +180,15 @@ function buildScanUnits(mode, queries, job, config) {
     Number(job.end_ts),
     config.fullSegmentHours ?? 24,
   );
-  return segments.flatMap((segment, segmentIndex) => queries.map((query, queryIndex) => ({
-    ...query,
-    queryIndex,
-    segmentIndex,
-    ...segment,
-  })));
+  return segments.flatMap((segment, segmentIndex) => (
+    randomizeQueriesForSegment(queries, job, segment, segmentIndex)
+      .map((query, queryIndex) => ({
+        ...query,
+        queryIndex,
+        segmentIndex,
+        ...segment,
+      }))
+  ));
 }
 
 function jobProgressKind(mode, config) {
@@ -166,7 +196,9 @@ function jobProgressKind(mode, config) {
     .flatMap((group) => group.queries.map((query) => `${group.label}:${query}`))
     .join("|");
   const fingerprint = createHash("sha256").update(keywordSignature).digest("hex").slice(0, 10);
-  const base = mode === "full" ? `segment-v2-time-first-${config.fullSegmentHours ?? 24}h` : "query-v1";
+  const base = mode === "full"
+    ? `segment-v3-random-groups-${config.fullSegmentHours ?? 24}h`
+    : "query-v2-random-groups";
   return `${base}-kw-${fingerprint}`;
 }
 
@@ -586,6 +618,7 @@ export {
   lastCompletedWeek,
   makeJobWindow,
   qualifiedRowsSnapshot,
+  randomizeQueriesForSegment,
   runCycle,
   runExport,
   runFeishu,
