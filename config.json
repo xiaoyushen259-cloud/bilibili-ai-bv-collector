@@ -44,7 +44,7 @@
     { "label": "龙虾", "queries": ["龙虾 AI"], "matchTerms": ["龙虾"], "requiredContextTerms": ["AI", "人工智能", "智能体", "Agent", "OpenClaw", "Open Claw"], "ambiguous": false },
     { "label": "MCP", "queries": ["MCP AI"], "matchTerms": ["MCP"], "requiredContextTerms": ["AI", "人工智能", "Agent", "智能体", "大模型", "LLM", "Claude", "Codex"], "ambiguous": false },
 
-    { "label": "Seedance", "legacyLabels": ["seedance2.0"], "queries": ["Seedance"], "matchTerms": ["Seedance 2.0", "Seedance2.0", "Seedance"], "ambiguous": false },
+    { "label": "Seedance", "legacyLabels": ["seedance2.0"], "queries": ["Seedance 2.0", "Seedance2.0"], "matchTerms": ["Seedance 2.0", "Seedance2.0", "Seedance"], "ambiguous": false },
     { "label": "Kling", "queries": ["Kling AI视频", "可灵 AI视频"], "matchTerms": ["Kling", "可灵"], "requiredContextTerms": ["AI视频", "视频", "Video", "文生视频", "图生视频", "视频生成"], "ambiguous": false },
     { "label": "Grok视频", "queries": ["Grok 视频"], "matchTerms": ["Grok Imagine", "Grok"], "requiredContextTerms": ["Imagine", "AI视频", "视频", "Video", "文生视频", "图生视频"], "ambiguous": false },
     { "label": "Sora", "queries": ["Sora 视频"], "matchTerms": ["Sora"], "requiredContextTerms": ["AI视频", "视频", "Video", "文生视频", "图生视频"], "ambiguous": false },
