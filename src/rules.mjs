@@ -31,6 +31,11 @@ export function requiredContextTermsForGroup(group) {
   return normalizedList(group.requiredContextTerms);
 }
 
+export function hasBlockedTitle(row, terms = []) {
+  const title = String(row?.title ?? "").toLocaleLowerCase("en-US");
+  return normalizedList(terms).some((term) => title.includes(term.toLocaleLowerCase("en-US")));
+}
+
 export function validateCollectorRules(config) {
   const labels = new Set();
   for (const group of activeKeywordGroups(config)) {
@@ -110,10 +115,18 @@ export function buildPartitionDatasets(rows, config) {
     const partitions = classifyVideo(row, config);
     return { ...row, content_partitions: partitions.join("、") };
   });
-  const partitions = (config.contentPartitions ?? []).map((partition) => ({
-    name: String(partition.name).trim(),
-    rows: enrichedRows.filter((row) => normalizedList(row.content_partitions).includes(String(partition.name).trim())),
-  }));
+  const partitions = (config.contentPartitions ?? []).map((partition) => {
+    const name = String(partition.name).trim();
+    const allRows = enrichedRows.filter((row) => normalizedList(row.content_partitions).includes(name));
+    return {
+      name,
+      rows: allRows,
+      totalRowCount: allRows.length,
+      targetCount: Number.isInteger(Number(config.courseTargetCount)) && Number(config.courseTargetCount) > 0
+        ? Number(config.courseTargetCount)
+        : null,
+    };
+  });
   return {
     rows: enrichedRows,
     partitions,
@@ -121,6 +134,42 @@ export function buildPartitionDatasets(rows, config) {
       ...partitions.map((partition) => partition.name),
       ...normalizedList(config.managedPartitionNames),
     ])],
+  };
+}
+
+export function buildFeishuWindowedDatasets(datasets, {
+  limit = 50,
+  archiveName = "历史归档",
+  blockedTitleTerms = [],
+} = {}) {
+  const rowLimit = Math.max(1, Number(limit) || 50);
+  const sortRows = (rows) => [...rows].sort((left, right) => (
+    Number(right.first_qualified_at) - Number(left.first_qualified_at)
+    || Number(right.play) - Number(left.play)
+    || String(left.bvid).localeCompare(String(right.bvid))
+  ));
+  const usedBvids = new Set();
+  const partitions = datasets.partitions.map((partition) => {
+    const rows = sortRows(partition.rows)
+      .filter((row) => !hasBlockedTitle(row, blockedTitleTerms))
+      .filter((row) => !usedBvids.has(row.bvid))
+      .slice(0, rowLimit);
+    for (const row of rows) usedBvids.add(row.bvid);
+    return {
+      ...partition,
+      rows,
+      totalRowCount: partition.totalRowCount ?? partition.rows.length,
+    };
+  });
+  const currentBvids = new Set(partitions.flatMap((partition) => partition.rows.map((row) => row.bvid)));
+  const currentRows = sortRows(datasets.rows.filter((row) => currentBvids.has(row.bvid)));
+  const archiveRows = sortRows(datasets.rows.filter((row) => !currentBvids.has(row.bvid)));
+  return {
+    ...datasets,
+    rows: currentRows,
+    partitions: [...partitions, { name: archiveName, rows: archiveRows, totalRowCount: archiveRows.length }],
+    managedPartitionNames: [...new Set([...(datasets.managedPartitionNames ?? []), archiveName])],
+    archiveRowCount: archiveRows.length,
   };
 }
 

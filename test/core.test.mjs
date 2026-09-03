@@ -10,7 +10,7 @@ import {
   shouldExportExcelAfterScan,
   splitWindowNewestFirst,
 } from "../app.mjs";
-import { buildPartitionDatasets, validateCollectorRules } from "../src/rules.mjs";
+import { activeKeywordGroups, buildFeishuWindowedDatasets, buildPartitionDatasets, validateCollectorRules } from "../src/rules.mjs";
 
 const config = JSON.parse(await fs.readFile(new URL("../config.json", import.meta.url), "utf8"));
 const group = (label) => config.keywordGroups.find((entry) => entry.label === label);
@@ -86,14 +86,14 @@ test("生产配置固定映射为五门课程且每个细分组都有归属", ()
   validateCollectorRules(config);
   assert.deepEqual(
     config.contentPartitions.map((partition) => partition.name),
-    ["Midjourney", "ComfyUI", "Agent", "AI视频", "WebUI"],
+    ["Midjourney", "ComfyUI", "Agent", "AI视频", "Stable Diffusion"],
   );
   const mappedGroups = new Set(config.contentPartitions.flatMap((partition) => partition.keywordGroups));
   assert.deepEqual(
-    config.keywordGroups.map((entry) => entry.label).filter((label) => !mappedGroups.has(label)),
+    activeKeywordGroups(config).map((entry) => entry.label).filter((label) => !mappedGroups.has(label)),
     [],
   );
-  assert.equal(flattenKeywordGroups(config).length, 23);
+  assert.ok(flattenKeywordGroups(config).length >= 200);
 
   const result = buildPartitionDatasets([
     { bvid: "BV1234567890", keywords: "ComfyUI-Flux", matched_queries: "Flux" },
@@ -104,10 +104,73 @@ test("生产配置固定映射为五门课程且每个细分组都有归属", ()
   ], config);
   assert.deepEqual(
     result.rows.map((row) => row.content_partitions),
-    ["ComfyUI", "Agent", "AI视频", "WebUI", "Midjourney"],
+    ["ComfyUI", "Agent", "AI视频", "Stable Diffusion", "Midjourney"],
   );
   assert.equal(result.partitions.length, 5);
   assert.ok(result.managedPartitionNames.includes("Codex分区"));
+});
+
+test("固定课程分区保留超过目标数量的全部数据", () => {
+  const partitionConfig = {
+    courseTargetCount: 2,
+    keywordGroups: [{ label: "codex", queries: ["codex"] }],
+    contentPartitions: [{ name: "Agent", keywordGroups: ["codex"] }],
+  };
+  const rows = Array.from({ length: 3 }, (_, index) => ({
+    bvid: `BV123456789${index}`,
+    keywords: "codex",
+    matched_queries: "codex",
+  }));
+  const result = buildPartitionDatasets(rows, partitionConfig);
+  assert.equal(result.partitions[0].rows.length, 3);
+  assert.equal(result.partitions[0].totalRowCount, 3);
+  assert.equal(result.partitions[0].targetCount, 2);
+});
+
+test("飞书主分区只保留最新记录，其余进入历史归档且不重复", () => {
+  const rows = [
+    { bvid: "BV1234567890", first_qualified_at: 100, play: 10000, content_partitions: "Agent" },
+    { bvid: "BV1234567891", first_qualified_at: 200, play: 20000, content_partitions: "Agent" },
+    { bvid: "BV1234567892", first_qualified_at: 300, play: 30000, content_partitions: "Agent" },
+  ];
+  const result = buildFeishuWindowedDatasets({
+    rows,
+    partitions: [{ name: "Agent", rows }],
+    managedPartitionNames: ["Agent"],
+  }, { limit: 2, archiveName: "历史归档" });
+  assert.deepEqual(result.partitions[0].rows.map((row) => row.bvid), ["BV1234567892", "BV1234567891"]);
+  assert.deepEqual(result.partitions[1].rows.map((row) => row.bvid), ["BV1234567890"]);
+  assert.deepEqual(result.rows.map((row) => row.bvid), ["BV1234567892", "BV1234567891"]);
+  assert.ok(result.managedPartitionNames.includes("历史归档"));
+});
+
+test("飞书当前分区之间不重复使用同一 BV", () => {
+  const shared = { bvid: "BV1234567890", first_qualified_at: 300, play: 30000 };
+  const agentOnly = { bvid: "BV1234567891", first_qualified_at: 200, play: 20000 };
+  const videoOnly = { bvid: "BV1234567892", first_qualified_at: 100, play: 10000 };
+  const result = buildFeishuWindowedDatasets({
+    rows: [shared, agentOnly, videoOnly],
+    partitions: [
+      { name: "Agent", rows: [shared, agentOnly] },
+      { name: "AI视频", rows: [shared, videoOnly] },
+    ],
+    managedPartitionNames: [],
+  }, { limit: 1 });
+  assert.deepEqual(result.partitions[0].rows.map((row) => row.bvid), [shared.bvid]);
+  assert.deepEqual(result.partitions[1].rows.map((row) => row.bvid), [videoOnly.bvid]);
+  assert.equal(new Set(result.rows.map((row) => row.bvid)).size, 2);
+});
+
+test("高风险标题不会进入飞书当前分区但会保留在历史归档", () => {
+  const safe = { bvid: "BV1234567890", title: "AI 有趣短片", first_qualified_at: 100, play: 10000 };
+  const risky = { bvid: "BV1234567891", title: "NSFW 破限制教程", first_qualified_at: 200, play: 20000 };
+  const result = buildFeishuWindowedDatasets({
+    rows: [safe, risky],
+    partitions: [{ name: "AI视频", rows: [safe, risky] }],
+    managedPartitionNames: ["AI视频"],
+  }, { limit: 2, blockedTitleTerms: ["NSFW", "破限制"] });
+  assert.deepEqual(result.partitions[0].rows.map((row) => row.bvid), [safe.bvid]);
+  assert.deepEqual(result.partitions[1].rows.map((row) => row.bvid), [risky.bvid]);
 });
 
 test("固定课程分区不能引用不存在的细分关键词组", () => {
@@ -232,6 +295,7 @@ test("生产配置的90天窗口按7天片段压缩主扫描单元", () => {
   assert.equal(units.length, 13);
   assert.equal(units[0].endTs, endTs);
   assert.equal(units.at(-1).startTs, 0);
+  assert.equal(config.courseLibraryLookbackDays, 90);
 });
 
 test("仅将B站412和v_voucher识别为可延期限流", () => {
@@ -271,8 +335,9 @@ test("生产配置使用12小时计划任务对应的保守采集参数", () => 
   assert.equal(config.incrementalOverlapHours, 14);
   assert.deepEqual([config.requestDelayMinMs, config.requestDelayMaxMs], [30000, 45000]);
   assert.deepEqual([config.keywordCooldownMinMs, config.keywordCooldownMaxMs], [90000, 150000]);
-  assert.equal(config.heavyKeywordRequestCount, 10);
+  assert.equal(config.heavyKeywordRequestCount, 6);
   assert.equal(config.heavyKeywordCooldownMs, 600000);
+  assert.equal(config.wbiKeyCacheHours, 6);
   assert.equal(config.backfillUnitsPerCycle, 3);
   assert.equal(config.maxConsecutiveRateLimitedUnits, 1);
 });

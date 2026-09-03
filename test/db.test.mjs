@@ -36,6 +36,28 @@ test("BV号去重且多关键词合并", () => {
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
+test("成功绑定历史可重复导入并从候选查询中排除", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "bv-db-binding-history-test-"));
+  const db = new CollectorDatabase(path.join(tempDir, "test.sqlite"));
+  const video = {
+    bvid: "BV1234567890", url: "https://www.bilibili.com/video/BV1234567890", title: "AI",
+    description: "", tags: "", play: 10000, pubdate: 1000, author: "UP", authorMid: "1", category: "科技",
+  };
+  db.upsertVideo(video, "AI", "AI", "AI上下文", 2000);
+  const first = db.recordBoundVideos([
+    { bvid: video.bvid, courseName: "Agent", batchLabel: "本周", sourceFile: "绑定bv.xlsx" },
+    { bvid: "invalid" },
+  ], 3000);
+  assert.deepEqual(first, { processed: 1, inserted: 1, total: 1 });
+  assert.equal(db.isPreviouslyBound(video.bvid), true);
+  assert.equal(db.listVideos({ cutoffTs: 0, excludeBound: false }).length, 1);
+  assert.equal(db.listVideos({ cutoffTs: 0, excludeBound: true }).length, 0);
+  const repeated = db.recordBoundVideos([{ bvid: video.bvid, batchLabel: "重复导入" }], 4000);
+  assert.deepEqual(repeated, { processed: 1, inserted: 0, total: 1 });
+  db.close();
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
 test("扫描任务断点和孤儿运行可恢复", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "bv-db-recovery-test-"));
   const db = new CollectorDatabase(path.join(tempDir, "test.sqlite"));
