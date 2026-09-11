@@ -110,6 +110,14 @@ test("生产配置固定映射为五门课程且每个细分组都有归属", ()
   assert.ok(result.managedPartitionNames.includes("Codex分区"));
 });
 
+test("扩展关键词仍保留 Seedance 2.0 精确搜索词且不退回裸词", () => {
+  const seedance = group("Seedance");
+  assert.ok(seedance.queries.includes("Seedance 2.0"));
+  assert.ok(seedance.queries.includes("Seedance2.0"));
+  assert.ok(!seedance.queries.includes("Seedance"));
+  assert.ok(seedance.legacyLabels.includes("seedance2.0"));
+});
+
 test("固定课程分区保留超过目标数量的全部数据", () => {
   const partitionConfig = {
     courseTargetCount: 2,
