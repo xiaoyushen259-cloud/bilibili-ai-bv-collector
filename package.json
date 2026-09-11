@@ -18,6 +18,7 @@
     "feishu:preview": "node app.mjs feishu preview",
     "feishu:doctor": "node app.mjs feishu doctor",
     "feishu:sync": "node app.mjs feishu sync",
+    "binding:import": "node scripts/import-binding-history.mjs",
     "test": "node --test"
   }
 }

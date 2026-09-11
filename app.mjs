@@ -5,10 +5,10 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { BilibiliClient } from "./src/bilibili.mjs";
 import { CollectorDatabase } from "./src/db.mjs";
-import { evaluateRelevance, flattenKeywordGroups, isWithinWindow, normalizeVideo } from "./src/core.mjs";
+import { evaluateRelevance, flattenKeywordGroups, isWithinWindow, normalizeVideo, parsePlay } from "./src/core.mjs";
 import { exportWorkbook } from "./src/exporter.mjs";
 import { buildFeishuMatrix, FeishuSheetsClient, loadFeishuSettings } from "./src/feishu.mjs";
-import { activeKeywordGroups, buildPartitionDatasets, validateCollectorRules } from "./src/rules.mjs";
+import { activeKeywordGroups, buildFeishuWindowedDatasets, buildPartitionDatasets, hasBlockedTitle, validateCollectorRules } from "./src/rules.mjs";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(ROOT, "config.json");
@@ -21,13 +21,30 @@ const LOCK_PATH = path.join(DATA_DIR, "collector.lock");
 const FEISHU_CONFIG_PATH = path.join(DATA_DIR, "feishu-config.json");
 const BILIBILI_BLOCKED_UNTIL_KEY = "bilibili_blocked_until";
 const BILIBILI_LAST_RATE_LIMIT_AT_KEY = "bilibili_last_rate_limit_at";
+const BILIBILI_ANONYMOUS_SESSION_KEY = "bilibili_anonymous_session_v1";
+const BILIBILI_THROTTLE_STATE_KEY = "bilibili_throttle_state_v1";
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
 }
 
+function courseLibraryLookbackDays(config) {
+  return Math.max(Number(config.lookbackDays), Number(config.courseLibraryLookbackDays ?? config.lookbackDays));
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseRuntimeJson(db, key) {
+  const value = db.getRuntimeState(key);
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    db.deleteRuntimeState(key);
+    return null;
+  }
 }
 
 function chinaDateParts(date = new Date()) {
@@ -207,11 +224,12 @@ export function shouldExportExcelAfterScan(config) {
 }
 
 async function exportScope(db, config, scope, { qa = false } = {}) {
-  const cutoffTs = nowSeconds() - config.lookbackDays * 86400;
+  const cutoffTs = nowSeconds() - courseLibraryLookbackDays(config) * 86400;
   const keywordGroups = activeKeywordGroups(config);
   if (scope === "master") {
     const rows = buildPartitionDatasets(
-      db.listVideos({ cutoffTs, minViews: config.minViews, keywordGroups }),
+      db.listVideos({ cutoffTs, minViews: config.minViews, keywordGroups, excludeBound: true })
+        .filter((row) => !hasBlockedTitle(row, config.bindingRiskTitleTerms)),
       config,
     ).rows;
     return exportWorkbook({
@@ -230,7 +248,8 @@ async function exportScope(db, config, scope, { qa = false } = {}) {
       firstQualifiedEnd: week.end,
       minViews: config.minViews,
       keywordGroups,
-    }), config).rows;
+      excludeBound: true,
+    }).filter((row) => !hasBlockedTitle(row, config.bindingRiskTitleTerms)), config).rows;
     const startLabel = chinaDateString(new Date(week.start * 1000));
     const endLabel = chinaDateString(new Date((week.end - 1) * 1000));
     return exportWorkbook({
@@ -278,6 +297,7 @@ async function executeScanUnit({ unit, index, totalUnits, mode, job, group, clie
       for (const raw of items) {
         const video = normalizeVideo(raw);
         if (!/^BV[0-9A-Za-z]{10}$/.test(video.bvid)) continue;
+        if (db.isPreviouslyBound(video.bvid)) continue;
         if (video.play < config.minViews || !isWithinWindow(video.pubdate, Number(job.start_ts), Number(job.end_ts))) continue;
         const relevance = evaluateRelevance(raw, group, config);
         if (!relevance.accepted) continue;
@@ -324,7 +344,16 @@ async function runScan(mode, { qa = false, maxUnits = Number.POSITIVE_INFINITY, 
     }
     if (blockedUntil > 0) db.deleteRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY);
 
-    client = new BilibiliClient(config);
+    client = new BilibiliClient(config, {
+      initialSession: parseRuntimeJson(db, BILIBILI_ANONYMOUS_SESSION_KEY),
+      initialThrottleState: parseRuntimeJson(db, BILIBILI_THROTTLE_STATE_KEY),
+      onSessionUpdate: (session) => {
+        db.setRuntimeState(BILIBILI_ANONYMOUS_SESSION_KEY, JSON.stringify(session));
+      },
+      onThrottleUpdate: (state) => {
+        db.setRuntimeState(BILIBILI_THROTTLE_STATE_KEY, JSON.stringify(state));
+      },
+    });
     const queries = flattenKeywordGroups(config);
     const expectedProgressKind = jobProgressKind(mode, config);
     job = db.getPendingJob(mode);
@@ -444,6 +473,170 @@ async function runCycle({ qa = false } = {}) {
   return { incremental, backfill, feishu };
 }
 
+function coursePartitionCounts(db, config, cutoffTs) {
+  const rows = db.listVideos({
+    cutoffTs,
+    minViews: config.minViews,
+    keywordGroups: activeKeywordGroups(config),
+    excludeBound: true,
+  }).filter((row) => !hasBlockedTitle(row, config.bindingRiskTitleTerms));
+  const datasets = buildFeishuWindowedDatasets(buildPartitionDatasets(rows, config), {
+    limit: config.feishuPartitionCurrentLimit ?? config.courseTargetCount ?? 50,
+    archiveName: config.feishuArchivePartitionName ?? "历史归档",
+  });
+  const currentPartitions = datasets.partitions.filter((partition) => partition.name !== (config.feishuArchivePartitionName ?? "历史归档"));
+  return Object.fromEntries(currentPartitions.map((partition) => [
+    partition.name,
+    partition.rows.length,
+  ]));
+}
+
+async function runCourseFill({ partitionTargets = null, maxPages = null } = {}) {
+  const config = await loadConfig();
+  const targetCount = Number(config.courseTargetCount ?? 50);
+  if (!Number.isInteger(targetCount) || targetCount < 1) {
+    throw new Error("courseTargetCount 必须是正整数");
+  }
+  await ensureDirectories();
+  await pruneLogs(config.logRetentionDays);
+  const releaseLock = await acquireLock(config);
+  const db = new CollectorDatabase(DB_PATH);
+  db.recoverOrphanedRuns(nowSeconds());
+  const stats = { requestCount: 0, qualifiedCount: 0, insertedCount: 0, updatedCount: 0 };
+  let client = null;
+  let runId = null;
+  try {
+    const endTs = nowSeconds();
+    const startTs = endTs - courseLibraryLookbackDays(config) * 86400;
+    const blockedUntil = Number(db.getRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY) ?? 0);
+    if (blockedUntil > endTs) {
+      await log(`B站接口仍处于412冷却期，课程补齐已跳过；恢复时间 ${new Date(blockedUntil * 1000).toISOString()}`, "WARN");
+      return {
+        skipped: true,
+        rateLimited: true,
+        blockedUntil,
+        targetCount,
+        partitionCounts: coursePartitionCounts(db, config, startTs),
+      };
+    }
+    if (blockedUntil > 0) db.deleteRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY);
+
+    runId = db.beginRun("course-fill", endTs);
+    const fillConfig = {
+      ...config,
+      requestDelayMinMs: Number(config.courseFillRequestDelayMinMs ?? config.requestDelayMinMs),
+      requestDelayMaxMs: Number(config.courseFillRequestDelayMaxMs ?? config.requestDelayMaxMs),
+      heavyKeywordRequestCount: Number(config.courseFillHeavyRequestCount ?? config.heavyKeywordRequestCount),
+      heavyKeywordCooldownMs: Number(config.courseFillHeavyCooldownMs ?? config.heavyKeywordCooldownMs),
+    };
+    client = new BilibiliClient(fillConfig, {
+      initialSession: parseRuntimeJson(db, BILIBILI_ANONYMOUS_SESSION_KEY),
+      initialThrottleState: parseRuntimeJson(db, BILIBILI_THROTTLE_STATE_KEY),
+      onSessionUpdate: (session) => {
+        db.setRuntimeState(BILIBILI_ANONYMOUS_SESSION_KEY, JSON.stringify(session));
+      },
+      onThrottleUpdate: (state) => {
+        db.setRuntimeState(BILIBILI_THROTTLE_STATE_KEY, JSON.stringify(state));
+      },
+    });
+
+    const groupByLabel = new Map(activeKeywordGroups(config).map((group) => [group.label, group]));
+    const maxPagesPerQuery = Math.max(1, Number(maxPages ?? config.courseFillMaxPagesPerQuery ?? 10));
+    let rateLimited = false;
+
+    partitionLoop:
+    for (const partition of config.contentPartitions ?? []) {
+      let counts = coursePartitionCounts(db, config, startTs);
+      let currentCount = Number(counts[partition.name] ?? 0);
+      const partitionTarget = Number(partitionTargets?.[partition.name] ?? targetCount);
+      if (!Number.isInteger(partitionTarget) || partitionTarget < 1) {
+        throw new Error(`课程“${partition.name}”的目标数必须是正整数`);
+      }
+      if (currentCount >= partitionTarget) {
+        await log(`课程“${partition.name}”已有 ${currentCount} 条，目标 ${partitionTarget} 条，无需补齐`);
+        continue;
+      }
+      await log(`课程“${partition.name}”当前 ${currentCount}/${partitionTarget}，开始定向补齐`);
+
+      const groups = (partition.keywordGroups ?? []).map((label) => groupByLabel.get(label)).filter(Boolean);
+      for (const group of groups) {
+        for (const query of group.queries ?? []) {
+          for (let page = 1; page <= maxPagesPerQuery; page += 1) {
+            let result;
+            try {
+              result = await client.search({ keyword: query, order: "click", page, startTs, endTs });
+            } catch (error) {
+              if (!isRateLimitError(error)) throw error;
+              const limitedAt = nowSeconds();
+              const block = calculateRateLimitBlock(
+                limitedAt,
+                db.getRuntimeState(BILIBILI_LAST_RATE_LIMIT_AT_KEY),
+                config,
+              );
+              db.setRuntimeState(BILIBILI_LAST_RATE_LIMIT_AT_KEY, limitedAt, limitedAt);
+              db.setRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY, block.blockedUntil, limitedAt);
+              await log(
+                `课程补齐因 412 暂停 ${block.cooldownHours} 小时，断点位于“${partition.name} / ${query} / 第 ${page} 页”；` +
+                `恢复时间 ${new Date(block.blockedUntil * 1000).toISOString()}`,
+                "WARN",
+              );
+              rateLimited = true;
+              break partitionLoop;
+            }
+
+            if (!result.items.length) break;
+            const qualifying = result.items.filter((item) => parsePlay(item.play) >= config.minViews);
+            for (const raw of qualifying) {
+              const video = normalizeVideo(raw);
+              if (!/^BV[0-9A-Za-z]{10}$/.test(video.bvid)) continue;
+              if (db.isPreviouslyBound(video.bvid)) continue;
+              if (hasBlockedTitle(video, config.bindingRiskTitleTerms)) continue;
+              if (!isWithinWindow(video.pubdate, startTs, endTs)) continue;
+              const relevance = evaluateRelevance(raw, group, config);
+              if (!relevance.accepted) continue;
+              const outcome = db.upsertVideo(
+                video,
+                group.label,
+                relevance.matchedQuery ?? query,
+                relevance.reason,
+                nowSeconds(),
+              );
+              stats.qualifiedCount += 1;
+              if (outcome === "inserted") stats.insertedCount += 1;
+              else stats.updatedCount += 1;
+            }
+
+            counts = coursePartitionCounts(db, config, startTs);
+            currentCount = Number(counts[partition.name] ?? 0);
+            await log(`课程“${partition.name}”使用“${query}”第 ${page} 页后达到 ${currentCount}/${partitionTarget}`);
+            if (currentCount >= partitionTarget) break;
+            if (qualifying.length < result.items.length || page >= Math.max(1, result.numPages)) break;
+          }
+          if (currentCount >= partitionTarget) break;
+        }
+        if (currentCount >= partitionTarget) break;
+      }
+    }
+
+    stats.requestCount = client.requestCount;
+    const partitionCounts = coursePartitionCounts(db, config, startTs);
+    db.finishRun(runId, stats);
+    await log(
+      `课程补齐${rateLimited ? "暂停" : "完成"}：新增 ${stats.insertedCount} 条，` +
+      `更新 ${stats.updatedCount} 条；${Object.entries(partitionCounts).map(([name, count]) => `${name} ${count}/${Number(partitionTargets?.[name] ?? targetCount)}`).join("，")}`,
+    );
+    return { ...stats, rateLimited, targetCount, partitionCounts };
+  } catch (error) {
+    stats.requestCount = client?.requestCount ?? 0;
+    if (runId !== null) db.finishRun(runId, stats, error);
+    await log(error.stack ?? String(error), "ERROR");
+    throw error;
+  } finally {
+    db.close();
+    await releaseLock();
+  }
+}
+
 async function qualifiedRowsSnapshot(config = null) {
   const activeConfig = config ?? await loadConfig();
   await ensureDirectories();
@@ -451,9 +644,10 @@ async function qualifiedRowsSnapshot(config = null) {
   const db = new CollectorDatabase(DB_PATH);
   try {
     return db.listVideos({
-      cutoffTs: nowSeconds() - activeConfig.lookbackDays * 86400,
+      cutoffTs: nowSeconds() - courseLibraryLookbackDays(activeConfig) * 86400,
       minViews: activeConfig.minViews,
       keywordGroups: activeKeywordGroups(activeConfig),
+      excludeBound: true,
     });
   } finally {
     db.close();
@@ -465,7 +659,11 @@ async function runFeishu(action = "preview", { settings: suppliedSettings = null
   const config = await loadConfig();
   if (action === "preview") {
     const snapshot = await qualifiedRowsSnapshot(config);
-    const datasets = buildPartitionDatasets(snapshot, config);
+    const datasets = buildFeishuWindowedDatasets(buildPartitionDatasets(snapshot, config), {
+      limit: config.feishuPartitionCurrentLimit ?? 50,
+      archiveName: config.feishuArchivePartitionName ?? "历史归档",
+      blockedTitleTerms: config.bindingRiskTitleTerms ?? [],
+    });
     const matrix = buildFeishuMatrix(datasets.rows);
     const preview = {
       rowCount: datasets.rows.length,
@@ -491,7 +689,11 @@ async function runFeishu(action = "preview", { settings: suppliedSettings = null
   }
   if (action === "sync") {
     const snapshot = await qualifiedRowsSnapshot(config);
-    const datasets = buildPartitionDatasets(snapshot, config);
+    const datasets = buildFeishuWindowedDatasets(buildPartitionDatasets(snapshot, config), {
+      limit: config.feishuPartitionCurrentLimit ?? 50,
+      archiveName: config.feishuArchivePartitionName ?? "历史归档",
+      blockedTitleTerms: config.bindingRiskTitleTerms ?? [],
+    });
     const result = await client.sync(datasets.rows, {
       partitions: datasets.partitions,
       managedPartitionNames: datasets.managedPartitionNames,
@@ -534,6 +736,8 @@ async function doctor() {
   await ensureDirectories();
   const db = new CollectorDatabase(DB_PATH);
   const blockedUntil = Number(db.getRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY) ?? 0);
+  const anonymousSession = parseRuntimeJson(db, BILIBILI_ANONYMOUS_SESSION_KEY);
+  const throttleState = parseRuntimeJson(db, BILIBILI_THROTTLE_STATE_KEY);
   const currentTs = nowSeconds();
   const checks = {
     node: process.version,
@@ -543,14 +747,23 @@ async function doctor() {
     activeKeywordGroups: activeKeywordGroups(config).length,
     bilibiliTransport: {
       searchApi: "WBI",
-      cookieStorage: "process-memory-only",
+      cookieStorage: "anonymous-identifiers-in-local-sqlite; login-cookies-never",
       requestIntervalMs: [config.requestDelayMinMs, config.requestDelayMaxMs],
+      heavyCooldown: {
+        everyRequests: config.heavyKeywordRequestCount,
+        cooldownMs: config.heavyKeywordCooldownMs,
+      },
+      anonymousSessionReady: Boolean(
+        anonymousSession?.cookies?.buvid3 && anonymousSession?.cookies?.buvid4
+      ),
+      requestsSinceHeavyCooldown: Number(throttleState?.requestsSinceHeavyCooldown ?? 0),
       collectionSchedule: "PT12H single task",
     },
     partitioning: config.partitioning ?? null,
     config: fsSync.existsSync(CONFIG_PATH),
     artifactTool: true,
     database: fsSync.existsSync(DB_PATH),
+    bindingHistoryCount: db.bindingHistoryCount(),
     schedulerCommand: process.platform === "win32" && fsSync.existsSync("C:\\Windows\\System32\\schtasks.exe"),
     bilibiliRateLimit: {
       blocked: blockedUntil > currentTs,
@@ -558,7 +771,7 @@ async function doctor() {
       blockedUntilIso: blockedUntil > 0 ? new Date(blockedUntil * 1000).toISOString() : null,
     },
     stats: db.stats(
-      nowSeconds() - config.lookbackDays * 86400,
+      nowSeconds() - courseLibraryLookbackDays(config) * 86400,
       config.minViews,
       activeKeywordGroups(config),
     ),
@@ -571,6 +784,18 @@ async function doctor() {
 function readOption(name, fallback = null) {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : fallback;
+}
+
+function parsePartitionTargets(value) {
+  if (!value) return null;
+  return Object.fromEntries(value.split(",").map((entry) => {
+    const separator = entry.lastIndexOf("=");
+    if (separator <= 0) throw new Error("--targets 格式应为 分区=目标数,分区=目标数");
+    const name = entry.slice(0, separator).trim();
+    const target = Number(entry.slice(separator + 1));
+    if (!Number.isInteger(target) || target < 1) throw new Error(`分区“${name}”的目标数必须是正整数`);
+    return [name, target];
+  }));
 }
 
 async function main() {
@@ -588,6 +813,18 @@ async function main() {
     return runScan(mode, { qa, maxUnits });
   }
   if (command === "cycle") return runCycle({ qa });
+  if (command === "fill-courses") {
+    const targets = parsePartitionTargets(readOption("--targets", null));
+    const maxPagesOption = readOption("--max-pages", null);
+    const maxPages = maxPagesOption === null ? null : Number(maxPagesOption);
+    if (maxPagesOption !== null && (!Number.isInteger(maxPages) || maxPages < 1)) {
+      throw new Error("--max-pages 必须是正整数");
+    }
+    const fill = await runCourseFill({ partitionTargets: targets, maxPages });
+    const feishu = await syncFeishuIfConfigured();
+    console.log(JSON.stringify({ fill, feishu }, null, 2));
+    return { fill, feishu };
+  }
   if (command === "feishu") return runFeishu(process.argv[3] ?? "preview");
   if (command === "export") {
     const scope = readOption("--scope", "master");
@@ -620,6 +857,7 @@ export {
   qualifiedRowsSnapshot,
   randomizeQueriesForSegment,
   runCycle,
+  runCourseFill,
   runExport,
   runFeishu,
   runScan,

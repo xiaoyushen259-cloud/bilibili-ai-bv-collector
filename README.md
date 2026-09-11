@@ -1,6 +1,6 @@
 # Bilibili AI BV Collector
 
-自动采集最近滚动 90 天内、播放量不少于 1 万且与指定 AI 关键词相关的 B站视频。结果以 BV号去重，保存在 SQLite，并导出为“BV汇总 + 视频明细”Excel。
+自动采集最近滚动 90 天内、播放量不少于 1 万且与指定 AI 关键词相关的 B站视频，并为五套课程维护近 90 天的补齐资料库。结果以 BV号去重，保存在 SQLite，并导出为“BV汇总 + 视频明细”Excel。
 
 ## 功能
 
@@ -11,7 +11,8 @@
 - SQLite 断点续扫、BV号去重、关键词合并、首次达标时间记录。
 - 每个时间片独立随机关键词组顺序，同一时间片不重复；组内别名连续扫描，断点恢复时保持原顺序。
 - 导出滚动主表和周报 Excel，包含可点击 B站直链。
-- 使用 WBI 搜索接口、完整浏览器请求头和进程内匿名 Cookie；Cookie 不落盘，进程退出即销毁。
+- 五套课程分表以 50 条为最低目标，低于目标时可用 `fill-courses` 定向补齐，超过 50 条的内容全部保留。
+- 使用 WBI 搜索接口、完整浏览器请求头和稳定匿名会话；仅把 `buvid3`、`buvid4` 等非登录标识保存在本机 SQLite，不保存登录 Cookie。
 - `412` 限流时延期当前单元并持久化暂停全部B站扫描至少 12 小时；48小时内再次触发则暂停 24 小时。不登录、不绕过验证码。
 
 ## 运行要求
@@ -50,6 +51,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ## 手动运行
 
+### Codex 对话采集
+
+在本项目中让 Codex「收集」或「补齐」视频时，第一尝试使用 `firecrawl-search` 技能；仅在 Firecrawl 不可用、额度不足、结果不足或缺少可核验的播放量／发布时间时，才使用现有 WBI 客户端核验或补充。执行规则见 [AGENTS.md](AGENTS.md)。这项偏好不改变下列命令和 Windows 定时任务的 WBI 实现。
+
+### 命令行与定时任务
+
 ```powershell
 $node = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe'
 & $node --no-warnings .\app.mjs doctor
@@ -65,7 +72,7 @@ $node = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\
 
 B站返回 `412` 或 `v_voucher` 时，当前扫描会保留到“关键词 + 7 天时间片”的断点并立即停止本批B站请求。冷却状态保存在 SQLite，首次触发暂停 12 小时，48 小时内再次触发暂停 24 小时；冷却期间计划任务仍可同步飞书，但会跳过B站请求。热门时间片达到接口 1,000 条上限时仍会自动二分。唯一的B站采集任务每 12 小时先执行增量扫描，再续跑最多 3 个首次回溯单元；周报任务只读取本地数据，不访问B站。
 
-默认请求节奏为所有B站网络请求之间随机等待 30～45 秒、切换关键词等待 90～150 秒、每连续 10 次请求额外冷却 10 分钟。每个进程先访问B站首页取得匿名 Cookie，再从导航接口取得 WBI 密钥，随后对搜索参数签名；这些请求使用同一个节流器。每 12 小时的增量窗口回看 14 小时，保留 2 小时重叠以防边界遗漏。
+默认请求节奏为所有B站网络请求之间随机等待 30～45 秒、切换关键词等待 90～150 秒、每连续 6 次请求额外冷却 10 分钟。请求计数和上次请求时间会跨进程保存在本机 SQLite，因此计划任务、手动扫描和进程重启不会重置限速。采集器首次运行时通过B站公开匿名指纹接口取得 `buvid3`、`buvid4`，后续复用同一匿名身份；WBI 密钥最多缓存 6 小时。每 12 小时的增量窗口回看 14 小时，保留 2 小时重叠以防边界遗漏。
 
 ## 运行消耗与电脑要求
 
@@ -144,13 +151,17 @@ B站返回 `412` 或 `v_voucher` 时，当前扫描会保留到“关键词 + 7 
 ```powershell
 & $node --no-warnings .\app.mjs feishu doctor
 & $node --no-warnings .\app.mjs feishu sync
+& $node --no-warnings .\app.mjs fill-courses
+& $node --no-warnings .\scripts\import-binding-history.mjs --file .\绑定成功.csv
 ```
 
 当 `enabled` 为 `true` 时，每次 `cycle` 完成后会自动同步一次。飞书同步失败不会删除本地 SQLite 数据。`config.json` 中的 `excelExportAfterScan` 默认关闭，因此自动采集不会生成 Excel 中转文件；Excel 仅在手动执行 `export` 命令时生成。
 
+绑定成功名单可用 CSV、TXT 或 JSON 导入。脚本会提取所有合法 BV号并写入永久历史表；之后扫描、定向补齐和飞书当前分区都会自动跳过这些 BV号。CSV 推荐使用 `bvid,courseName,batchLabel` 三列。待绑定分区之间也会全局去重，高风险标题只保留在“历史归档”。
+
 ## 数据与隐私
 
-仓库不包含本机数据库、运行日志、Excel 结果、飞书密钥或 Cookie。采集器仅访问 B站公开首页、导航接口和 WBI 搜索接口；匿名 Cookie 只保存在当前 Node.js 进程内，并遵守保守的单线程请求间隔。接口异常时保留本地断点。
+仓库不包含本机数据库、运行日志、Excel 结果、飞书密钥或 Cookie。本机 SQLite 只保存采集数据、限速状态以及 `buvid3`、`buvid4` 等匿名标识，不保存 `SESSDATA` 等登录凭证；该数据库已被 Git 忽略。采集器仅访问B站公开首页、匿名指纹、导航和 WBI 搜索接口，并遵守跨进程单线程限速。接口异常时保留本地断点。
 
 ## License
 

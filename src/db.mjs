@@ -72,9 +72,17 @@ export class CollectorDatabase {
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS binding_history (
+        bvid TEXT PRIMARY KEY,
+        course_name TEXT NOT NULL DEFAULT '',
+        batch_label TEXT NOT NULL DEFAULT '',
+        source_file TEXT NOT NULL DEFAULT '',
+        recorded_at INTEGER NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_videos_pubdate ON videos(pubdate);
       CREATE INDEX IF NOT EXISTS idx_videos_first_qualified ON videos(first_qualified_at);
       CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(mode, status, id);
+      CREATE INDEX IF NOT EXISTS idx_binding_history_batch ON binding_history(batch_label, course_name);
     `);
     const jobColumns = new Set(this.db.prepare("PRAGMA table_info(scan_jobs)").all().map((column) => column.name));
     if (!jobColumns.has("progress_kind")) {
@@ -99,6 +107,47 @@ export class CollectorDatabase {
 
   deleteRuntimeState(key) {
     this.db.prepare("DELETE FROM runtime_state WHERE key=?").run(key);
+  }
+
+  isPreviouslyBound(bvid) {
+    return Boolean(this.db.prepare("SELECT 1 FROM binding_history WHERE bvid=?").get(String(bvid)));
+  }
+
+  bindingHistoryCount() {
+    return Number(this.db.prepare("SELECT COUNT(*) AS count FROM binding_history").get().count);
+  }
+
+  recordBoundVideos(records, nowTs = Math.floor(Date.now() / 1000)) {
+    const normalized = [...new Map((records ?? []).map((record) => {
+      const bvid = String(record?.bvid ?? "").trim();
+      return [bvid, {
+        bvid,
+        courseName: String(record?.courseName ?? "").trim(),
+        batchLabel: String(record?.batchLabel ?? "").trim(),
+        sourceFile: String(record?.sourceFile ?? "").trim(),
+      }];
+    }).filter(([bvid]) => /^BV[0-9A-Za-z]{10}$/.test(bvid))).values()];
+    const statement = this.db.prepare(`
+      INSERT INTO binding_history(bvid,course_name,batch_label,source_file,recorded_at)
+      VALUES(?,?,?,?,?)
+      ON CONFLICT(bvid) DO UPDATE SET
+        course_name=CASE WHEN excluded.course_name<>'' THEN excluded.course_name ELSE binding_history.course_name END,
+        batch_label=CASE WHEN excluded.batch_label<>'' THEN excluded.batch_label ELSE binding_history.batch_label END,
+        source_file=CASE WHEN excluded.source_file<>'' THEN excluded.source_file ELSE binding_history.source_file END
+    `);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const before = this.bindingHistoryCount();
+      for (const record of normalized) {
+        statement.run(record.bvid, record.courseName, record.batchLabel, record.sourceFile, nowTs);
+      }
+      const after = this.bindingHistoryCount();
+      this.db.exec("COMMIT");
+      return { processed: normalized.length, inserted: after - before, total: after };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   beginRun(mode, nowTs) {
@@ -248,6 +297,7 @@ export class CollectorDatabase {
     firstQualifiedEnd = null,
     minViews = 0,
     keywordGroups = null,
+    excludeBound = false,
   } = {}) {
     const clauses = ["v.pubdate >= ?", "v.play >= ?"];
     const params = [cutoffTs, minViews];
@@ -259,6 +309,7 @@ export class CollectorDatabase {
       clauses.push("v.first_qualified_at < ?");
       params.push(firstQualifiedEnd);
     }
+    if (excludeBound) clauses.push("NOT EXISTS (SELECT 1 FROM binding_history b WHERE b.bvid=v.bvid)");
     const rows = this.db.prepare(`
       SELECT v.*,
         (SELECT GROUP_CONCAT(k.keyword_group || char(31) || k.matched_query, char(30))

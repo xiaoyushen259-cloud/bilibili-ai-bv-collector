@@ -152,8 +152,9 @@ test("WBI 参数签名与公开算法样例一致", () => {
   assert.equal(signed.wRid, "8f6f2b5b3d485fe1886cec6a0be8c5d4");
 });
 
-test("匿名 Cookie 仅在进程内传给 WBI 导航和搜索请求", async () => {
+test("匿名标识传给 WBI 导航和搜索请求，并可输出受限会话快照", async () => {
   const calls = [];
+  const sessionSnapshots = [];
   const fetchImpl = mockBilibili(
     async () => response({ code: 0, data: { result: [], numPages: 0, numResults: 0 } }),
     calls,
@@ -163,6 +164,7 @@ test("匿名 Cookie 仅在进程内传给 WBI 导航和搜索请求", async () =
     sleepImpl: async () => {},
     random: () => 0,
     nowImpl: () => 1702204169000,
+    onSessionUpdate: (snapshot) => sessionSnapshots.push(snapshot),
   });
   await client.search({ keyword: "Claude Code", order: "click", page: 1, startTs: 1, endTs: 2 });
 
@@ -179,6 +181,85 @@ test("匿名 Cookie 仅在进程内传给 WBI 导航和搜索请求", async () =
   assert.equal(calls[3].url.searchParams.get("wts"), "1702204169");
   assert.match(calls[3].url.searchParams.get("w_rid"), /^[0-9a-f]{32}$/);
   assert.equal(client.requestCount, 4);
+  assert.equal(sessionSnapshots.at(-1).cookies.buvid3, "spi-anonymous-test-id");
+  assert.equal(sessionSnapshots.at(-1).cookies.buvid4, "spi-anonymous-test-id-4");
+  assert.deepEqual(Object.keys(sessionSnapshots.at(-1).cookies).sort(), [
+    "CURRENT_FNVAL",
+    "b_nut",
+    "buvid3",
+    "buvid4",
+  ]);
+});
+
+test("复用持久匿名会话和有效 WBI 密钥时只发起搜索请求", async () => {
+  const calls = [];
+  const nowMs = 1702204169000;
+  const client = new BilibiliClient(baseConfig, {
+    initialSession: {
+      cookies: {
+        buvid3: "stable-buvid3",
+        buvid4: "stable-buvid4",
+        CURRENT_FNVAL: "4048",
+        SESSDATA: "must-not-be-loaded",
+      },
+      wbiKeys: {
+        imgKey: "7cd084941338484aae1ad9425b84077c",
+        subKey: "4932caff0ff746eab6f01bf08b70ac45",
+        expiresAt: nowMs + 3600_000,
+      },
+    },
+    fetchImpl: async (url, options) => {
+      calls.push({ url: new URL(url), options });
+      return response({ code: 0, data: { result: [], numPages: 0, numResults: 0 } });
+    },
+    sleepImpl: async () => {},
+    random: () => 0,
+    nowImpl: () => nowMs,
+  });
+
+  await client.search({ keyword: "AI", order: "click", page: 1, startTs: 1, endTs: 2 });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url.pathname, "/x/web-interface/wbi/search/type");
+  assert.match(calls[0].options.headers.Cookie, /buvid3=stable-buvid3/);
+  assert.doesNotMatch(calls[0].options.headers.Cookie, /SESSDATA/);
+});
+
+test("重度冷却计数跨进程恢复后会在下一请求前等待", async () => {
+  let nowMs = 1702204169000;
+  const sleeps = [];
+  const throttleSnapshots = [];
+  const client = new BilibiliClient({
+    ...baseConfig,
+    heavyKeywordRequestCount: 6,
+    heavyKeywordCooldownMs: 600000,
+  }, {
+    initialSession: {
+      cookies: { buvid3: "stable-buvid3", buvid4: "stable-buvid4" },
+      wbiKeys: {
+        imgKey: "7cd084941338484aae1ad9425b84077c",
+        subKey: "4932caff0ff746eab6f01bf08b70ac45",
+        expiresAt: nowMs + 3600_000,
+      },
+    },
+    initialThrottleState: {
+      lastRequestAt: nowMs - 1000,
+      requestsSinceHeavyCooldown: 6,
+    },
+    fetchImpl: async () => response({ code: 0, data: { result: [], numPages: 0, numResults: 0 } }),
+    sleepImpl: async (ms) => {
+      sleeps.push(ms);
+      nowMs += ms;
+    },
+    random: () => 0,
+    nowImpl: () => nowMs,
+    onThrottleUpdate: (snapshot) => throttleSnapshots.push(snapshot),
+  });
+
+  await client.search({ keyword: "codex", order: "click", page: 1, startTs: 1, endTs: 2 });
+
+  assert.deepEqual(sleeps, [599000]);
+  assert.equal(throttleSnapshots.at(-1).requestsSinceHeavyCooldown, 1);
 });
 
 test("匿名导航返回 -101 但包含 WBI 密钥时仍可搜索", async () => {

@@ -5,6 +5,7 @@ const HOME_URL = "https://www.bilibili.com/";
 const SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi";
 const NAV_URL = "https://api.bilibili.com/x/web-interface/nav";
 const SEARCH_URL = "https://api.bilibili.com/x/web-interface/wbi/search/type";
+const ANONYMOUS_COOKIE_NAMES = new Set(["buvid3", "buvid4", "b_nut", "CURRENT_FNVAL"]);
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const MIXIN_KEY_ENC_TAB = [
   46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
@@ -57,11 +58,53 @@ export class BilibiliClient {
     this.sleepImpl = options.sleepImpl ?? sleep;
     this.random = options.random ?? Math.random;
     this.nowImpl = options.nowImpl ?? Date.now;
+    this.onSessionUpdate = options.onSessionUpdate ?? null;
+    this.onThrottleUpdate = options.onThrottleUpdate ?? null;
     this.requestCount = 0;
-    this.lastRequestAt = 0;
-    this.cookies = new Map();
-    this.sessionReady = false;
-    this.wbiKeys = null;
+    this.lastRequestAt = Math.max(0, Number(options.initialThrottleState?.lastRequestAt) || 0);
+    this.requestsSinceHeavyCooldown = Math.max(
+      0,
+      Number(options.initialThrottleState?.requestsSinceHeavyCooldown) || 0,
+    );
+    this.cookies = new Map(
+      Object.entries(options.initialSession?.cookies ?? {})
+        .filter(([name, value]) => ANONYMOUS_COOKIE_NAMES.has(name) && typeof value === "string" && value),
+    );
+    this.sessionReady = this.cookies.has("buvid3") && this.cookies.has("buvid4");
+    const cachedKeys = options.initialSession?.wbiKeys;
+    this.wbiKeys = cachedKeys?.imgKey
+      && cachedKeys?.subKey
+      && Number(cachedKeys?.expiresAt) > this.nowImpl()
+      ? {
+        imgKey: String(cachedKeys.imgKey),
+        subKey: String(cachedKeys.subKey),
+        expiresAt: Number(cachedKeys.expiresAt),
+      }
+      : null;
+  }
+
+  sessionSnapshot() {
+    return {
+      version: 1,
+      cookies: Object.fromEntries(
+        [...this.cookies.entries()].filter(([name]) => ANONYMOUS_COOKIE_NAMES.has(name)),
+      ),
+      wbiKeys: this.wbiKeys,
+      updatedAt: this.nowImpl(),
+    };
+  }
+
+  persistSession() {
+    this.onSessionUpdate?.(this.sessionSnapshot());
+  }
+
+  persistThrottleState() {
+    this.onThrottleUpdate?.({
+      version: 1,
+      lastRequestAt: this.lastRequestAt,
+      requestsSinceHeavyCooldown: this.requestsSinceHeavyCooldown,
+      updatedAt: this.nowImpl(),
+    });
   }
 
   cookieHeader() {
@@ -104,14 +147,30 @@ export class BilibiliClient {
   async throttle() {
     const min = Number(this.config.requestDelayMinMs);
     const max = Number(this.config.requestDelayMaxMs);
+    const heavyRequestCount = Number(this.config.heavyKeywordRequestCount ?? 0);
+    const heavyCooldownMs = Number(this.config.heavyKeywordCooldownMs ?? 0);
+    let elapsed = this.nowImpl() - this.lastRequestAt;
+    if (
+      this.lastRequestAt
+      && heavyRequestCount > 0
+      && this.requestsSinceHeavyCooldown >= heavyRequestCount
+    ) {
+      if (heavyCooldownMs > 0 && elapsed < heavyCooldownMs) {
+        await this.sleepImpl(heavyCooldownMs - elapsed);
+      }
+      this.requestsSinceHeavyCooldown = 0;
+      this.persistThrottleState();
+      elapsed = this.nowImpl() - this.lastRequestAt;
+    }
     const targetDelay = min + Math.floor(this.random() * Math.max(1, max - min + 1));
-    const elapsed = this.nowImpl() - this.lastRequestAt;
     if (this.lastRequestAt && elapsed < targetDelay) await this.sleepImpl(targetDelay - elapsed);
   }
 
   async request(url, { document = false } = {}) {
     await this.throttle();
     this.lastRequestAt = this.nowImpl();
+    this.requestsSinceHeavyCooldown += 1;
+    this.persistThrottleState();
     this.requestCount += 1;
     const response = await this.fetchImpl(url, {
       method: "GET",
@@ -157,6 +216,7 @@ export class BilibiliClient {
       throw error;
     }
     this.sessionReady = true;
+    this.persistSession();
   }
 
   async getWbiKeys({ refresh = false } = {}) {
@@ -173,7 +233,13 @@ export class BilibiliClient {
       }
       throw new Error("B站导航接口缺少 WBI 图片密钥");
     }
-    this.wbiKeys = { imgKey, subKey };
+    const cacheHours = Math.max(1, Number(this.config.wbiKeyCacheHours ?? 6));
+    this.wbiKeys = {
+      imgKey,
+      subKey,
+      expiresAt: this.nowImpl() + cacheHours * 3600_000,
+    };
+    this.persistSession();
     return this.wbiKeys;
   }
 
