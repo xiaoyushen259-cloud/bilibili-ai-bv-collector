@@ -51,6 +51,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ## 手动运行
 
+### Codex 对话采集
+
+在本项目中让 Codex「收集」或「补齐」视频时，第一尝试使用 `firecrawl-search` 技能；仅在 Firecrawl 不可用、额度不足、结果不足或缺少可核验的播放量／发布时间时，才使用现有 WBI 客户端核验或补充。执行规则见 [AGENTS.md](AGENTS.md)。这项偏好不改变下列命令和 Windows 定时任务的 WBI 实现。
+
+### 命令行与定时任务
+
 ```powershell
 $node = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe'
 & $node --no-warnings .\app.mjs doctor
