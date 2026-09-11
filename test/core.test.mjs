@@ -93,7 +93,7 @@ test("生产配置固定映射为五门课程且每个细分组都有归属", ()
     config.keywordGroups.map((entry) => entry.label).filter((label) => !mappedGroups.has(label)),
     [],
   );
-  assert.equal(flattenKeywordGroups(config).length, 23);
+  assert.equal(flattenKeywordGroups(config).length, 24);
 
   const result = buildPartitionDatasets([
     { bvid: "BV1234567890", keywords: "ComfyUI-Flux", matched_queries: "Flux" },
