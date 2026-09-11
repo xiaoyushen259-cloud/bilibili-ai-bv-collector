@@ -4,6 +4,9 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { BilibiliClient } from "./src/bilibili.mjs";
+import { FirecrawlClient } from "./src/firecrawl.mjs";
+import { ACTIVE_BATCH_KEY, batchDatasets, collectBatch, collectionProvider, positiveInteger } from "./src/collection-batch.mjs";
+import { syncVerifiedBatch } from './src/batch-publish.mjs';
 import { CollectorDatabase } from "./src/db.mjs";
 import { evaluateRelevance, flattenKeywordGroups, isWithinWindow, normalizeVideo, parsePlay } from "./src/core.mjs";
 import { exportWorkbook } from "./src/exporter.mjs";
@@ -324,8 +327,68 @@ async function executeScanUnit({ unit, index, totalUnits, mode, job, group, clie
   );
 }
 
-async function runScan(mode, { qa = false, maxUnits = Number.POSITIVE_INFINITY, resumeOnly = false } = {}) {
+async function runBatch(options = {}) {
   const config = await loadConfig();
+  await ensureDirectories();
+  const releaseLock = await acquireLock(config);
+  const db = new CollectorDatabase(DB_PATH);
+  let runId;
+  try {
+    db.recoverOrphanedRuns(nowSeconds());
+    runId = db.beginRun("firecrawl-batch", nowSeconds());
+    const beforeCount = db.listVideos().length;
+    const result = await collectBatch({
+      ...options, db, config, log,
+      firecrawl: new FirecrawlClient({ evidenceDir: path.join(DATA_DIR, '.firecrawl'),
+        limit: positiveInteger(config.firecrawlResultsPerSearch ?? 20, 'firecrawlResultsPerSearch', 100) }),
+      createWbi: async () => {
+        const blockedUntil = Number(db.getRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY) ?? 0);
+        if (blockedUntil > nowSeconds()) {
+          await log(`WBI 仍处于冷却期，跳过补充；恢复时间 ${new Date(blockedUntil * 1000).toISOString()}`, 'WARN');
+          return null;
+        }
+        return new BilibiliClient(config, {
+          initialSession: parseRuntimeJson(db, BILIBILI_ANONYMOUS_SESSION_KEY),
+          initialThrottleState: parseRuntimeJson(db, BILIBILI_THROTTLE_STATE_KEY),
+          onSessionUpdate: s => db.setRuntimeState(BILIBILI_ANONYMOUS_SESSION_KEY, JSON.stringify(s)),
+          onThrottleUpdate: s => db.setRuntimeState(BILIBILI_THROTTLE_STATE_KEY, JSON.stringify(s)),
+        });
+      },
+      onWbiError: async error => {
+        if (isRateLimitError(error)) {
+          const limitedAt = nowSeconds();
+          const block = calculateRateLimitBlock(limitedAt, db.getRuntimeState(BILIBILI_LAST_RATE_LIMIT_AT_KEY), config);
+          db.setRuntimeState(BILIBILI_LAST_RATE_LIMIT_AT_KEY, limitedAt);
+          db.setRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY, block.blockedUntil);
+        }
+        await log('WBI 补充失败，已保留批次进度；未清除任何冷却状态', 'WARN');
+      },
+    });
+    const insertedCount = db.listVideos().length - beforeCount;
+    db.finishRun(runId, { requestCount: result.searches + result.wbiRequests,
+      insertedCount, qualifiedCount: insertedCount, updatedCount: 0 });
+    return result;
+  } catch (error) {
+    if (runId) db.finishRun(runId, {}, error);
+    throw error;
+  } finally { db.close(); await releaseLock(); }
+}
+
+async function currentBatchSnapshot(config) {
+  await ensureDirectories();
+  const releaseLock = await acquireLock(config);
+  const db = new CollectorDatabase(DB_PATH);
+  try {
+    const state = parseRuntimeJson(db, ACTIVE_BATCH_KEY);
+    if (state) return batchDatasets(db, config, state, nowSeconds());
+    if (collectionProvider(config) === 'firecrawl') throw new Error('尚未建立当天采集批次，请先运行 app.mjs collect，再预览或同步飞书');
+    return null;
+  } finally { db.close(); await releaseLock(); }
+}
+
+async function runScan(mode, { qa = false, maxUnits = Number.POSITIVE_INFINITY, resumeOnly = false, provider, batchRunner = runBatch, ...batchOptions } = {}) {
+  const config = await loadConfig();
+  if (collectionProvider(config, provider) === 'firecrawl') return batchRunner(batchOptions);
   await ensureDirectories();
   await pruneLogs(config.logRetentionDays);
   const releaseLock = await acquireLock(config);
@@ -461,13 +524,19 @@ async function runScan(mode, { qa = false, maxUnits = Number.POSITIVE_INFINITY, 
   }
 }
 
-async function runCycle({ qa = false } = {}) {
+async function runCycle({ qa = false, provider, batchRunner = runBatch, ...batchOptions } = {}) {
   const config = await loadConfig();
-  const incremental = await runScan("incremental", { qa });
+  if (collectionProvider(config, provider) === 'firecrawl') {
+    const batch = await batchRunner(batchOptions);
+    const feishu = batch.complete ? await syncFeishuIfConfigured() : { skipped: true, reason: '本批未补齐，保留现有飞书内容' };
+    return { batch, feishu };
+  }
+  const incremental = await runScan("incremental", { qa, provider: 'wbi' });
   const backfill = await runScan("full", {
     qa,
     maxUnits: config.backfillUnitsPerCycle ?? 40,
     resumeOnly: true,
+    provider: 'wbi',
   });
   const feishu = await syncFeishuIfConfigured();
   return { incremental, backfill, feishu };
@@ -491,8 +560,9 @@ function coursePartitionCounts(db, config, cutoffTs) {
   ]));
 }
 
-async function runCourseFill({ partitionTargets = null, maxPages = null } = {}) {
+async function runCourseFill({ partitionTargets = null, maxPages = null, provider, batchRunner = runBatch, ...batchOptions } = {}) {
   const config = await loadConfig();
+  if (collectionProvider(config, provider) === 'firecrawl') return batchRunner({ ...batchOptions, partitionTargets, maxPages });
   const targetCount = Number(config.courseTargetCount ?? 50);
   if (!Number.isInteger(targetCount) || targetCount < 1) {
     throw new Error("courseTargetCount 必须是正整数");
@@ -659,7 +729,7 @@ async function runFeishu(action = "preview", { settings: suppliedSettings = null
   const config = await loadConfig();
   if (action === "preview") {
     const snapshot = await qualifiedRowsSnapshot(config);
-    const datasets = buildFeishuWindowedDatasets(buildPartitionDatasets(snapshot, config), {
+    const datasets = await currentBatchSnapshot(config) ?? buildFeishuWindowedDatasets(buildPartitionDatasets(snapshot, config), {
       limit: config.feishuPartitionCurrentLimit ?? 50,
       archiveName: config.feishuArchivePartitionName ?? "历史归档",
       blockedTitleTerms: config.bindingRiskTitleTerms ?? [],
@@ -689,12 +759,15 @@ async function runFeishu(action = "preview", { settings: suppliedSettings = null
   }
   if (action === "sync") {
     const snapshot = await qualifiedRowsSnapshot(config);
-    const datasets = buildFeishuWindowedDatasets(buildPartitionDatasets(snapshot, config), {
+    const datasets = await currentBatchSnapshot(config) ?? buildFeishuWindowedDatasets(buildPartitionDatasets(snapshot, config), {
       limit: config.feishuPartitionCurrentLimit ?? 50,
       archiveName: config.feishuArchivePartitionName ?? "历史归档",
       blockedTitleTerms: config.bindingRiskTitleTerms ?? [],
     });
-    const result = await client.sync(datasets.rows, {
+    if (datasets.complete === false) throw new Error('本批尚未补齐或有记录已失效，拒绝覆盖飞书；请继续 collect');
+    const result = datasets.complete === true
+      ? await syncVerifiedBatch(client, settings, datasets, path.join(DATA_DIR, 'feishu-backups'))
+      : await client.sync(datasets.rows, {
       partitions: datasets.partitions,
       managedPartitionNames: datasets.managedPartitionNames,
     });
@@ -745,6 +818,9 @@ async function doctor() {
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     configuredTimezone: config.timezone,
     activeKeywordGroups: activeKeywordGroups(config).length,
+    collectionProvider: collectionProvider(config),
+    firecrawl: await new FirecrawlClient({ evidenceDir: path.join(DATA_DIR, '.firecrawl') }).check()
+      .catch(() => ({ cliAvailable: false, note: '请先安装 Firecrawl CLI 并登录；详见 README 首次使用' })),
     bilibiliTransport: {
       searchApi: "WBI",
       cookieStorage: "anonymous-identifiers-in-local-sqlite; login-cookies-never",
@@ -802,6 +878,29 @@ async function main() {
   const command = process.argv[2] ?? "doctor";
   const qa = process.argv.includes("--qa");
   if (command === "doctor") return doctor();
+  if (command === 'firecrawl-check') {
+    const client = new FirecrawlClient({ evidenceDir: path.join(DATA_DIR, '.firecrawl'), limit: 1 });
+    const result = await client.search({ keyword: 'ComfyUI', startTs: nowSeconds() - 90 * 86400 });
+    const report = { success: true, results: result.documents.length, evidenceFile: result.evidenceFile,
+      note: '仅测试一次 Firecrawl 搜索，不写入采集数据库或飞书；会消耗 Firecrawl 额度' };
+    console.log(JSON.stringify(report, null, 2)); return report;
+  }
+  const batchOptions = {
+    provider: readOption('--provider', undefined),
+    target: readOption('--target', undefined),
+    maxSearches: readOption('--max-searches', undefined),
+    maxWbiRequests: readOption('--max-wbi-requests', undefined),
+    allowWbi: !process.argv.includes('--no-wbi'),
+  };
+  if (command === 'collect') {
+    if (collectionProvider(await loadConfig(), batchOptions.provider) !== 'firecrawl') throw new Error('collect 是 Firecrawl 优先批次入口；旧 WBI 扫描请显式使用 scan --provider wbi');
+    const result = await runBatch(batchOptions);
+    if (process.argv.includes('--sync')) {
+      if (!result.complete) throw new Error('本批未补齐，未写入飞书');
+      await runFeishu('sync');
+    }
+    return result;
+  }
   if (command === "scan") {
     const mode = readOption("--mode", "incremental");
     if (!["incremental", "full"].includes(mode)) throw new Error("--mode 仅支持 incremental 或 full");
@@ -810,9 +909,9 @@ async function main() {
     if (maxUnitsOption !== null && (!Number.isInteger(maxUnits) || maxUnits < 1)) {
       throw new Error("--max-units 必须是正整数");
     }
-    return runScan(mode, { qa, maxUnits });
+    return runScan(mode, { qa, maxUnits, ...batchOptions });
   }
-  if (command === "cycle") return runCycle({ qa });
+  if (command === "cycle") return runCycle({ qa, ...batchOptions });
   if (command === "fill-courses") {
     const targets = parsePartitionTargets(readOption("--targets", null));
     const maxPagesOption = readOption("--max-pages", null);
@@ -820,8 +919,8 @@ async function main() {
     if (maxPagesOption !== null && (!Number.isInteger(maxPages) || maxPages < 1)) {
       throw new Error("--max-pages 必须是正整数");
     }
-    const fill = await runCourseFill({ partitionTargets: targets, maxPages });
-    const feishu = await syncFeishuIfConfigured();
+    const fill = await runCourseFill({ partitionTargets: targets, maxPages, ...batchOptions });
+    const feishu = fill.complete === false ? { skipped: true, reason: '本批未补齐' } : await syncFeishuIfConfigured();
     console.log(JSON.stringify({ fill, feishu }, null, 2));
     return { fill, feishu };
   }
@@ -861,6 +960,7 @@ export {
   runExport,
   runFeishu,
   runScan,
+  runBatch,
   syncFeishuIfConfigured,
   splitWindowNewestFirst,
 };

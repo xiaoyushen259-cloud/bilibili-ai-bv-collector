@@ -256,7 +256,8 @@ export class CollectorDatabase {
 
   upsertVideo(video, groupLabel, matchedQuery, relevanceReason, nowTs) {
     const existing = this.db.prepare("SELECT play FROM videos WHERE bvid=?").get(video.bvid);
-    this.db.exec("BEGIN IMMEDIATE");
+    // Savepoints also work inside a batch transaction that saves the ledger atomically.
+    this.db.exec("SAVEPOINT upsert_video");
     try {
       this.db.prepare(`
         INSERT INTO videos(
@@ -283,9 +284,9 @@ export class CollectorDatabase {
       this.db.prepare(`
         INSERT OR IGNORE INTO keyword_hits(bvid,keyword_group,matched_query) VALUES(?,?,?)
       `).run(video.bvid, groupLabel, matchedQuery);
-      this.db.exec("COMMIT");
+      this.db.exec("RELEASE upsert_video");
     } catch (error) {
-      this.db.exec("ROLLBACK");
+      this.db.exec("ROLLBACK TO upsert_video; RELEASE upsert_video");
       throw error;
     }
     return existing ? "updated" : "inserted";

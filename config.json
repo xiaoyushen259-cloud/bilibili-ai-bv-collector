@@ -1,5 +1,10 @@
 {
   "timezone": "Asia/Shanghai",
+  "collectionProvider": "firecrawl",
+  "firecrawlMaxSearches": 20,
+  "firecrawlResultsPerSearch": 20,
+  "batchWbiMaxRequests": 20,
+  "batchWbiMaxPages": 3,
   "lookbackDays": 90,
   "courseLibraryLookbackDays": 90,
   "minViews": 10000,

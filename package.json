@@ -9,6 +9,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "collect": "node app.mjs collect",
     "doctor": "node app.mjs doctor",
     "cycle": "node app.mjs cycle",
     "scan:incremental": "node app.mjs scan --mode incremental",
