@@ -31,6 +31,25 @@ export function isRateLimitError(error) {
   return /v_voucher|-412|HTTP (?:412|429)|接口错误 (?:-352|-509|429)|验证码|访问过于频繁|异常流量/i.test(text);
 }
 
+// Daily fills use their own normal pacing; risk-triggered cooldown settings stay unchanged.
+export function courseFillClientConfig(config) {
+  const result = { ...config };
+  for (const [field, source, fallback] of [
+    ['requestDelayMinMs', 'courseFillRequestDelayMinMs', 5000],
+    ['requestDelayMaxMs', 'courseFillRequestDelayMaxMs', 8000],
+    ['heavyKeywordRequestCount', 'courseFillHeavyRequestCount', 10],
+    ['heavyKeywordCooldownMs', 'courseFillHeavyCooldownMs', 60000],
+  ]) {
+    const value = Number(config[source] ?? fallback);
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${source} 必须为正整数`);
+    result[field] = value;
+  }
+  if (result.requestDelayMaxMs < result.requestDelayMinMs) {
+    throw new Error('courseFillRequestDelayMaxMs 不能小于 courseFillRequestDelayMinMs');
+  }
+  return result;
+}
+
 function responseSetCookies(headers) {
   if (typeof headers?.getSetCookie === "function") return headers.getSetCookie();
   const combined = headers?.get?.("set-cookie");
@@ -65,6 +84,7 @@ export class BilibiliClient {
     this.nowImpl = options.nowImpl ?? Date.now;
     this.onSessionUpdate = options.onSessionUpdate ?? null;
     this.onThrottleUpdate = options.onThrottleUpdate ?? null;
+    this.onHeavyWait = options.onHeavyWait ?? null;
     this.requestCount = 0;
     this.lastRequestAt = Math.max(0, Number(options.initialThrottleState?.lastRequestAt) || 0);
     this.requestsSinceHeavyCooldown = Math.max(
@@ -161,6 +181,7 @@ export class BilibiliClient {
       && this.requestsSinceHeavyCooldown >= heavyRequestCount
     ) {
       if (heavyCooldownMs > 0 && elapsed < heavyCooldownMs) {
+        await this.onHeavyWait?.(heavyCooldownMs - elapsed);
         await this.sleepImpl(heavyCooldownMs - elapsed);
       }
       this.requestsSinceHeavyCooldown = 0;
