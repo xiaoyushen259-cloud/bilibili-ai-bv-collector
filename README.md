@@ -1,6 +1,6 @@
 # Bilibili AI BV Collector
 
-收集近滚动 90 天、播放量严格超过 1 万的 AI 相关 B站视频 BV号。默认 **Firecrawl 搜索并抓取正文优先，服务不可用、结果不足或无法核验时才使用 WBI 补充**。
+收集近滚动 90 天、播放量严格超过 1 万的 AI 相关 B站视频 BV号。默认顺序：**Firecrawl → B站移动端搜索（第二档）→ WBI（第三档）**。上一档服务不可用、结果不足或无法核验时才进入下一档；已经满额则停止。
 
 五个当前分区：Midjourney、ComfyUI、Agent、AI视频、Stable Diffusion。每天每区默认新增 50 条，排除本机历史、已绑定和跨分区重复。MJ、SD 不足时以有趣、恶搞类 AI 成片补位，不用教程冒充趣味成片；补位不代表视频确实使用了 MJ/SD。
 
@@ -54,10 +54,10 @@ CSV 推荐列为 bvid,courseName,batchLabel。绑定名单不等于全部采集�
 
 ### 4. 小批量试跑，再补到每区 50 条
 
-先每区 5 条，最多 5 次 Firecrawl 搜索，不回退 WBI、不写飞书：
+先每区 5 条，最多 5 次 Firecrawl 搜索，不回退移动端或 WBI、不写飞书：
 
 ```powershell
-& $node .\app.mjs collect --target 5 --max-searches 5 --no-wbi
+& $node .\app.mjs collect --target 5 --max-searches 5 --no-mobile --no-wbi
 ```
 
 正式补齐当天每区 50 条，然后预览：
@@ -69,7 +69,9 @@ CSV 推荐列为 bvid,courseName,batchLabel。绑定名单不等于全部采集�
 
 当天重复运行续补同一批次，从 5 提升到 50 时保留已有 5 条；不能把目标降低到当天已收集数量以下。第二天新建批次，旧 BV 继续参与排重。
 
-默认每次最多 20 次 Firecrawl 搜索，每次最多 20 个正文结果；不足时最多 20 次 WBI 搜索，每词最多 3 页。用 --max-searches、--max-wbi-requests 调整预算，--no-wbi 禁止回退。预算不是数量保证，未达标数量会如实报告。
+默认每次最多 20 次 Firecrawl 搜索，每次最多 20 个正文结果；第二档移动端最多 60 次 HTTP 请求（含搜索和逐条详情核验），仍不足才进入第三档，最多 20 次 WBI 搜索。两档 B站搜索每词最多 3 页。用 --max-searches、--max-mobile-requests、--max-wbi-requests 调整各档预算。--no-mobile 只禁用移动端，--no-wbi 只禁用 WBI；仅用 Firecrawl 时两个开关都要带。预算不是数量保证，未达标数量会如实报告。
+
+第二档沿用历史 Mobile Search 的无签名搜索接口与移动网页发现路径，但搜索页的近似播放量不计入：逐条使用视频详情接口取得精确数据，并在 data/.mobile-search 保存证据。当天分页进度与已核验新增 BV 一起保留，重复运行继续补齐。
 
 程序核验正文的精确播放量和带时区的发布时间；仅搜索摘要、近似显示或缺少详情的候选不直接入库。日期搜索过滤不能代替逐条核验。
 
@@ -102,7 +104,7 @@ config.json 中 collectionProvider 默认 firecrawl。collect、scan --mode full
 & $node .\app.mjs scan --mode full --provider wbi
 ```
 
-旧模式不是当天新增 50 条流程。WBI 保留原有匿名会话、跨进程限速、412/v_voucher 冷却：首次至少 12 小时，48 小时内再次触发为 24 小时。不清除冷却、不绕过验证码。scripts 下旧 mobile-search/backfill 工具不是新人入口。
+旧模式不是当天新增 50 条流程。移动端和 WBI 共用跨进程限速、412/429/v_voucher 冷却：首次至少 12 小时，48 小时内再次触发为 24 小时。移动端触发限流后不会继续请求网页或 WBI。不清除冷却、不绕过验证码。第二档已集成到 collect；scripts 下旧 mobile-search/backfill 工具仍不是新人入口。
 
 ## 定时任务：可选
 

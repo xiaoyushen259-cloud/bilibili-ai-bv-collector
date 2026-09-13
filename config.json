@@ -3,6 +3,7 @@
   "collectionProvider": "firecrawl",
   "firecrawlMaxSearches": 20,
   "firecrawlResultsPerSearch": 20,
+  "batchMobileMaxRequests": 60,
   "batchWbiMaxRequests": 20,
   "batchWbiMaxPages": 3,
   "lookbackDays": 90,

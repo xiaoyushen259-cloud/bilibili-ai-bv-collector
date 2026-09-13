@@ -3,7 +3,8 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { BilibiliClient } from "./src/bilibili.mjs";
+import { BilibiliClient, isRateLimitError } from "./src/bilibili.mjs";
+import { MobileSearchClient } from "./src/mobile-search.mjs";
 import { FirecrawlClient } from "./src/firecrawl.mjs";
 import { ACTIVE_BATCH_KEY, batchDatasets, collectBatch, collectionProvider, positiveInteger } from "./src/collection-batch.mjs";
 import { syncVerifiedBatch } from './src/batch-publish.mjs';
@@ -266,11 +267,6 @@ async function exportScope(db, config, scope, { qa = false } = {}) {
   throw new Error(`未知导出范围：${scope}`);
 }
 
-function isRateLimitError(error) {
-  const text = `${String(error?.message ?? error)} ${String(error?.stdout ?? "")}`;
-  return text.includes("v_voucher") || text.includes("-412") || text.includes("HTTP 412");
-}
-
 function calculateRateLimitBlock(nowTs, lastRateLimitAt, config) {
   const repeatWindowSeconds = Number(config.rateLimitRepeatWindowHours ?? 48) * 3600;
   const last = Number(lastRateLimitAt);
@@ -337,23 +333,27 @@ async function runBatch(options = {}) {
     db.recoverOrphanedRuns(nowSeconds());
     runId = db.beginRun("firecrawl-batch", nowSeconds());
     const beforeCount = db.listVideos().length;
+    const createBilibili = async (Client, extra = {}) => {
+      const blockedUntil = Number(db.getRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY) ?? 0);
+      if (blockedUntil > nowSeconds()) {
+        await log(`B站仍处于冷却期，跳过移动端和 WBI；恢复时间 ${new Date(blockedUntil * 1000).toISOString()}`, 'WARN');
+        return null;
+      }
+      return new Client(config, {
+        initialSession: parseRuntimeJson(db, BILIBILI_ANONYMOUS_SESSION_KEY),
+        initialThrottleState: parseRuntimeJson(db, BILIBILI_THROTTLE_STATE_KEY),
+        onSessionUpdate: s => db.setRuntimeState(BILIBILI_ANONYMOUS_SESSION_KEY, JSON.stringify(s)),
+        onThrottleUpdate: s => db.setRuntimeState(BILIBILI_THROTTLE_STATE_KEY, JSON.stringify(s)),
+        ...extra,
+      });
+    };
     const result = await collectBatch({
       ...options, db, config, log,
       firecrawl: new FirecrawlClient({ evidenceDir: path.join(DATA_DIR, '.firecrawl'),
         limit: positiveInteger(config.firecrawlResultsPerSearch ?? 20, 'firecrawlResultsPerSearch', 100) }),
-      createWbi: async () => {
-        const blockedUntil = Number(db.getRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY) ?? 0);
-        if (blockedUntil > nowSeconds()) {
-          await log(`WBI 仍处于冷却期，跳过补充；恢复时间 ${new Date(blockedUntil * 1000).toISOString()}`, 'WARN');
-          return null;
-        }
-        return new BilibiliClient(config, {
-          initialSession: parseRuntimeJson(db, BILIBILI_ANONYMOUS_SESSION_KEY),
-          initialThrottleState: parseRuntimeJson(db, BILIBILI_THROTTLE_STATE_KEY),
-          onSessionUpdate: s => db.setRuntimeState(BILIBILI_ANONYMOUS_SESSION_KEY, JSON.stringify(s)),
-          onThrottleUpdate: s => db.setRuntimeState(BILIBILI_THROTTLE_STATE_KEY, JSON.stringify(s)),
-        });
-      },
+      createMobile: options => createBilibili(MobileSearchClient,
+        { ...options, evidenceDir: path.join(DATA_DIR, '.mobile-search') }),
+      createWbi: () => createBilibili(BilibiliClient),
       onWbiError: async error => {
         if (isRateLimitError(error)) {
           const limitedAt = nowSeconds();
@@ -361,11 +361,11 @@ async function runBatch(options = {}) {
           db.setRuntimeState(BILIBILI_LAST_RATE_LIMIT_AT_KEY, limitedAt);
           db.setRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY, block.blockedUntil);
         }
-        await log('WBI 补充失败，已保留批次进度；未清除任何冷却状态', 'WARN');
+        await log('B站补充失败，已保留批次进度；未清除任何冷却状态', 'WARN');
       },
     });
     const insertedCount = db.listVideos().length - beforeCount;
-    db.finishRun(runId, { requestCount: result.searches + result.wbiRequests,
+    db.finishRun(runId, { requestCount: result.searches + result.mobileRequests + result.wbiRequests,
       insertedCount, qualifiedCount: insertedCount, updatedCount: 0 });
     return result;
   } catch (error) {
@@ -889,7 +889,9 @@ async function main() {
     provider: readOption('--provider', undefined),
     target: readOption('--target', undefined),
     maxSearches: readOption('--max-searches', undefined),
+    maxMobileRequests: readOption('--max-mobile-requests', undefined),
     maxWbiRequests: readOption('--max-wbi-requests', undefined),
+    allowMobile: !process.argv.includes('--no-mobile'),
     allowWbi: !process.argv.includes('--no-wbi'),
   };
   if (command === 'collect') {

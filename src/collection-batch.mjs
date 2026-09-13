@@ -1,6 +1,7 @@
 import { activeKeywordGroups, buildPartitionDatasets, hasBlockedTitle } from './rules.mjs';
 import { containsTerm, evaluateRelevance, isWithinWindow, normalizeVideo } from './core.mjs';
 import { parseFirecrawlVideo } from './firecrawl.mjs';
+import { isRateLimitError } from './bilibili.mjs';
 
 export const ACTIVE_BATCH_KEY = 'active_collection_batch_v1';
 const FUN = /恶搞|搞笑|整活|鬼畜|抽象|发癫|爆笑|沙雕|离谱|脑洞|反转|假如|如果|重拍|二创|同人|喜剧|AI全民制作人/;
@@ -64,9 +65,10 @@ export function batchDatasets(db, config, state, nowTs) {
     managedPartitionNames: [] };
 }
 
-export async function collectBatch({ db, config, firecrawl, createWbi, onWbiError,
+export async function collectBatch({ db, config, firecrawl, createMobile, createWbi, onWbiError = async () => {},
   log = async () => {}, now = () => Math.floor(Date.now() / 1000),
-  target, partitionTargets, maxSearches, maxWbiRequests, maxPages, allowWbi = true }) {
+  target, partitionTargets, maxSearches, maxMobileRequests, maxWbiRequests, maxPages,
+  allowMobile = true, allowWbi = true }) {
   const started = now(), day = batchDay(started), key = `collection_batch_v1:${day}`;
   const targets = Object.fromEntries(config.contentPartitions.map(p => [p.name,
     positiveInteger(partitionTargets?.[p.name] ?? target ?? config.courseTargetCount ?? 50, '目标数量')]));
@@ -125,8 +127,9 @@ export async function collectBatch({ db, config, firecrawl, createWbi, onWbiErro
   const jobs = searchJobs(config);
   const searchBudget = positiveInteger(maxSearches ?? config.firecrawlMaxSearches ?? 20, 'max-searches');
   const wbiBudget = positiveInteger(maxWbiRequests ?? config.batchWbiMaxRequests ?? 20, 'max-wbi-requests');
+  const mobileBudget = positiveInteger(maxMobileRequests ?? config.batchMobileMaxRequests ?? 60, 'max-mobile-requests');
   const pageLimit = positiveInteger(maxPages ?? config.batchWbiMaxPages ?? 3, 'max-pages');
-  let searches = 0, wbiRequests = 0, fallbackReason = null;
+  let searches = 0, mobileRequests = 0, wbiRequests = 0, fallbackReason = null, bilibiliBlocked = false;
   if (!complete()) await log('第一尝试：Firecrawl 搜索并抓取正文；仅有可核验播放量和发布时间的视频计入本批');
   for (const job of jobs) {
     const queryKey = `firecrawl:${job.partition}:${job.keyword}`;
@@ -144,8 +147,46 @@ export async function collectBatch({ db, config, firecrawl, createWbi, onWbiErro
   }
   if (!complete()) {
     fallbackReason ??= 'Firecrawl 搜索预算内结果不足或缺少可核验证据';
-    await log(`${fallbackReason}；${allowWbi ? '尝试 WBI 补充，仍遵守原有冷却限制' : '已禁用 WBI，本批保留缺口'}`);
-    if (allowWbi) {
+    await log(`${fallbackReason}；${allowMobile ? '第二档：移动端搜索 + 详情接口核验' : '已禁用移动端搜索'}`);
+    if (allowMobile) {
+      let mobile;
+      const mobileFailed = async error => {
+        bilibiliBlocked = isRateLimitError(error);
+        await onWbiError(error);
+        fallbackReason = bilibiliBlocked ? '移动端触发限流，暂停全部 B站请求' : '移动端补充失败';
+      };
+      try {
+        mobile = await createMobile({ maxRequests: mobileBudget });
+        if (!mobile) { bilibiliBlocked = true; fallbackReason = 'B站仍处于冷却期'; }
+      } catch (error) { await mobileFailed(error); }
+      mobileLoop: for (const job of jobs) {
+        if (!mobile || complete()) break;
+        if (full(job.partition)) continue;
+        for (let page = 1; page <= pageLimit; page++) {
+          if (complete() || mobile.requestCount >= mobileBudget) break mobileLoop;
+          if (full(job.partition)) break;
+          const queryKey = `mobile:${job.partition}:${job.keyword}:${page}`;
+          if (state.completedQueries.includes(queryKey)) continue;
+          let result;
+          try {
+            result = await mobile.search({ keyword: job.keyword, page, order: 'click',
+              startTs: started - config.lookbackDays * 86400, endTs: started,
+              shouldFetch: bvid => !exists.get(bvid) && !db.isPreviouslyBound(bvid) });
+          } catch (error) { await mobileFailed(error); break mobileLoop; }
+          for (const video of result.items) accept(video, job,
+            { provider: '移动端搜索+详情精确数值', evidenceFile: result.evidenceFile });
+          if (result.error && !result.exhausted) { await mobileFailed(result.error); break mobileLoop; }
+          if (result.exhausted) break mobileLoop; // Retry incomplete page on next run.
+          state.completedQueries.push(queryKey); save();
+          await log(`移动端 ${job.keyword} 第${page}页：${JSON.stringify(counts())}`);
+          if (page >= result.numPages) break;
+        }
+      }
+      mobileRequests = mobile?.requestCount ?? 0;
+      if (!complete() && !bilibiliBlocked) fallbackReason = '移动端预算内结果不足或补充失败';
+    }
+    if (!complete()) await log(`${fallbackReason}；${bilibiliBlocked ? 'B站处于冷却，不启动 WBI' : allowWbi ? '第三档：WBI 补充' : '已禁用 WBI，本批保留缺口'}`);
+    if (!complete() && allowWbi && !bilibiliBlocked) {
       const client = await createWbi(); // Lazy: never initializes Bilibili before Firecrawl has been attempted.
       if (client) {
         wbiLoop: for (const job of jobs) {
@@ -170,7 +211,7 @@ export async function collectBatch({ db, config, firecrawl, createWbi, onWbiErro
   }
   state.complete = complete(); save();
   const report = { day, complete: state.complete, targetCounts: targets, partitionCounts: counts(),
-    total: state.records.length, searches, wbiRequests, fallbackReason };
+    total: state.records.length, searches, mobileRequests, wbiRequests, fallbackReason };
   await log(`${state.complete ? '本批已补齐' : '本批未补齐，不自动发布'}：${JSON.stringify(report)}`);
   return report;
 }
