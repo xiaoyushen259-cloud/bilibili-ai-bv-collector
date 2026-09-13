@@ -26,6 +26,11 @@ function jsonError(body) {
   return new Error(`B站接口返回的不是有效 JSON：${String(body).slice(0, 300)}`);
 }
 
+export function isRateLimitError(error) {
+  const text = `${String(error?.message ?? error)} ${String(error?.stdout ?? '')}`;
+  return /v_voucher|-412|HTTP (?:412|429)|接口错误 (?:-352|-509|429)|验证码|访问过于频繁|异常流量/i.test(text);
+}
+
 function responseSetCookies(headers) {
   if (typeof headers?.getSetCookie === "function") return headers.getSetCookie();
   const combined = headers?.get?.("set-cookie");
@@ -293,8 +298,7 @@ export class BilibiliClient {
         lastError = error;
         if (error?.noRetry) break;
         if (errorAttempts >= this.config.maxRetries) break;
-        const errorText = `${String(error?.message ?? error)} ${String(error?.stdout ?? "")}`;
-        const rateLimited = errorText.includes("v_voucher") || errorText.includes("-412") || errorText.includes("HTTP 412");
+        const rateLimited = isRateLimitError(error);
         if (rateLimited) {
           if (rateLimitAttempts >= this.config.maxRateLimitRetries) break;
           rateLimitAttempts += 1;

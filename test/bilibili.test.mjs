@@ -99,12 +99,21 @@ test("临时HTTP错误会重试", async () => {
   let attempts = 0;
   const fetchImpl = mockBilibili(async () => {
     attempts += 1;
-    if (attempts === 1) return response({}, 429);
+    if (attempts === 1) return response({}, 503);
     return response({ code: 0, data: { result: [], numPages: 0, numResults: 0 } });
   });
   const client = new BilibiliClient(baseConfig, { fetchImpl, sleepImpl: async () => {}, random: () => 0 });
   await client.search({ keyword: "AI", order: "click", page: 1, startTs: 0, endTs: 1 });
   assert.equal(attempts, 2);
+});
+
+test('HTTP 429 不按普通错误重试，交给全局冷却', async () => {
+  let attempts = 0;
+  const client = new BilibiliClient(baseConfig, { fetchImpl: mockBilibili(async () => {
+    attempts++; return response({}, 429);
+  }), sleepImpl: async () => {}, random: () => 0 });
+  await assert.rejects(client.search({ keyword: 'AI', order: 'click', page: 1, startTs: 0, endTs: 1 }), /HTTP 429/);
+  assert.equal(attempts, 1);
 });
 
 test("零结果时允许 data.result 为 null", async () => {

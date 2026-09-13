@@ -23,7 +23,7 @@ const config = { lookbackDays: 90, minViews: 10000, courseTargetCount: 1, aiCont
   contentPartitions: [{ name: 'ComfyUI', keywordGroups: ['comfyui'] }] };
 function fixture(t) {
   const db = new CollectorDatabase(':memory:'); t.after(() => db.close());
-  return { db, config, now: () => nowTs, allowWbi: false };
+  return { db, config, now: () => nowTs, allowMobile: false, allowWbi: false };
 }
 
 test('旧 scan、fill-courses、cycle 默认都走批次入口，未满额 cycle 不写飞书', async () => {
@@ -68,6 +68,80 @@ test('Firecrawl 不可用后才初始化 WBI，传递精确时间窗', async t =
       calls.push('wbi-search'); return { items: [video(1)], numPages: 1 };
     } }; }, onWbiError: async () => assert.fail('不应失败') });
   assert.deepEqual(calls, ['fc', 'wbi-init', 'wbi-search']);
+  assert.equal(result.complete, true);
+});
+
+test('默认依次 Firecrawl → 移动端 → WBI；移动端满额就停止', async t => {
+  for (const mobileFull of [true, false]) {
+    const f = fixture(t), calls = [];
+    const result = await collectBatch({ ...f, allowMobile: true, allowWbi: true, maxSearches: 1,
+      firecrawl: { search: async () => { calls.push('fc'); return { documents: [] }; } },
+      createMobile: async () => { calls.push('mobile-init'); return { requestCount: 0, search: async () => {
+        calls.push('mobile'); return { items: mobileFull ? [video(1)] : [], numPages: 1 };
+      } }; },
+      createWbi: async () => { calls.push('wbi-init'); return { search: async () => {
+        calls.push('wbi'); return { items: [video(2)], numPages: 1 };
+      } }; } });
+    assert.equal(result.complete, true);
+    assert.equal(calls[0], 'fc'); assert.equal(calls[1], 'mobile-init');
+    if (mobileFull) assert.equal(calls.includes('wbi-init'), false);
+    else assert.ok(calls.indexOf('wbi-init') > calls.lastIndexOf('mobile'));
+  }
+});
+
+test('Firecrawl满额完全不初始化移动端或WBI', async t => {
+  const result = await collectBatch({ ...fixture(t), allowMobile: true, allowWbi: true,
+    firecrawl: { search: async () => ({ documents: [doc(1)] }) },
+    createMobile: async () => assert.fail('不应创建移动端'), createWbi: async () => assert.fail('不应创建WBI') });
+  assert.equal(result.complete, true);
+});
+
+test('移动端普通错误后可回退WBI，限流或已在冷却则禁止WBI', async t => {
+  for (const message of ['HTTP 503', 'HTTP 412', 'HTTP 429', 'v_voucher', 'cooldown']) {
+    const f = fixture(t); let wbiCalls = 0, errors = 0;
+    const result = await collectBatch({ ...f, allowMobile: true, allowWbi: true, maxSearches: 1,
+      firecrawl: { search: async () => ({ documents: [] }) },
+      createMobile: async () => message === 'cooldown' ? null : { requestCount: 1,
+        search: async () => ({ items: [video(1)], error: new Error(message) }) },
+      target: 2, createWbi: async () => { wbiCalls++; return { search: async () => ({ items: [video(2)], numPages: 1 }) }; },
+      onWbiError: async () => { errors++; } });
+    assert.equal(wbiCalls, message === 'HTTP 503' ? 1 : 0);
+    assert.equal(errors, message === 'cooldown' ? 0 : 1);
+    assert.equal(result.total, message === 'cooldown' ? 0 : message === 'HTTP 503' ? 2 : 1);
+  }
+});
+
+test('移动端不完整页续跑不丢进度，沿用历史排重与精确时间窗', async t => {
+  const f = fixture(t); let run = 0;
+  f.db.recordBoundVideos([{ bvid: bv(9) }]);
+  const options = { ...f, allowMobile: true, target: 2, maxSearches: 1,
+    firecrawl: { search: async () => ({ documents: [] }) },
+    createMobile: async () => ({ requestCount: 2, search: async args => {
+      assert.equal(args.page, 1); assert.equal(args.startTs, nowTs - 90 * 86400);
+      assert.equal(args.shouldFetch(bv(9)), false);
+      if (run++) {
+        assert.equal(args.shouldFetch(bv(1)), false);
+        return { items: [video(2)], numPages: 1 };
+      }
+      return { items: [video(1)], exhausted: true, error: new Error('budget') };
+    } }) };
+  assert.equal((await collectBatch(options)).complete, false);
+  assert.equal((await collectBatch(options)).complete, true);
+  assert.equal(run, 2);
+});
+
+test('移动端某分区满额后继续其他分区，过滤历史、已绑定、边界与无关视频', async t => {
+  const f = fixture(t);
+  f.db.upsertVideo(normalizeVideo(video(8)), 'comfyui', 'ComfyUI', '历史', nowTs - 86400);
+  f.db.recordBoundVideos([{ bvid: bv(9) }]);
+  const multi = { ...config, contentPartitions: [...config.contentPartitions,
+    { name: 'Agent', keywordGroups: ['comfyui'] }] };
+  const result = await collectBatch({ ...f, config: multi, allowMobile: true, maxSearches: 1,
+    firecrawl: { search: async () => ({ documents: [] }) },
+    createMobile: async () => ({ requestCount: 0, search: async () => ({ numPages: 3,
+      items: [video(8), video(9), video(3, { play: 10000 }), video(4, { pubdate: nowTs - 91 * 86400 }),
+        video(5, { pubdate: nowTs + 1 }), video(6, { title: '无关电影', tags: '' }), video(1), video(2)] }) }) });
+  assert.deepEqual(result.partitionCounts, { ComfyUI: 1, Agent: 1 });
   assert.equal(result.complete, true);
 });
 

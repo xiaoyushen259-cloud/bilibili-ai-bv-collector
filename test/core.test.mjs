@@ -306,10 +306,12 @@ test("生产配置的90天窗口按7天片段压缩主扫描单元", () => {
   assert.equal(config.courseLibraryLookbackDays, 90);
 });
 
-test("仅将B站412和v_voucher识别为可延期限流", () => {
+test("将B站412、429和v_voucher识别为可延期限流", () => {
   assert.equal(isRateLimitError(new Error("HTTP 412: request was banned")), true);
   assert.equal(isRateLimitError(new Error("B站接口返回结构异常 v_voucher")), true);
   assert.equal(isRateLimitError(new Error("HTTP 500")), false);
+  assert.equal(isRateLimitError(new Error("HTTP 429")), true);
+  assert.equal(isRateLimitError(new Error("B站接口错误 -352")), true);
 });
 
 test("ClaudeCode 别名统一归入 Claude Code", () => {
