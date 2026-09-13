@@ -3,7 +3,7 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { BilibiliClient, isRateLimitError } from "./src/bilibili.mjs";
+import { BilibiliClient, courseFillClientConfig, isRateLimitError } from "./src/bilibili.mjs";
 import { MobileSearchClient } from "./src/mobile-search.mjs";
 import { FirecrawlClient } from "./src/firecrawl.mjs";
 import { ACTIVE_BATCH_KEY, batchDatasets, collectBatch, collectionProvider, positiveInteger } from "./src/collection-batch.mjs";
@@ -333,17 +333,20 @@ async function runBatch(options = {}) {
     db.recoverOrphanedRuns(nowSeconds());
     runId = db.beginRun("firecrawl-batch", nowSeconds());
     const beforeCount = db.listVideos().length;
+    const fillConfig = courseFillClientConfig(config);
     const createBilibili = async (Client, extra = {}) => {
       const blockedUntil = Number(db.getRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY) ?? 0);
       if (blockedUntil > nowSeconds()) {
         await log(`B站仍处于冷却期，跳过移动端和 WBI；恢复时间 ${new Date(blockedUntil * 1000).toISOString()}`, 'WARN');
         return null;
       }
-      return new Client(config, {
+      await log(`日常补齐节奏：请求间隔 ${fillConfig.requestDelayMinMs / 1000}～${fillConfig.requestDelayMaxMs / 1000} 秒，每 ${fillConfig.heavyKeywordRequestCount} 次休息 ${fillConfig.heavyKeywordCooldownMs / 1000} 秒；限流冷却不变`);
+      return new Client(fillConfig, {
         initialSession: parseRuntimeJson(db, BILIBILI_ANONYMOUS_SESSION_KEY),
         initialThrottleState: parseRuntimeJson(db, BILIBILI_THROTTLE_STATE_KEY),
         onSessionUpdate: s => db.setRuntimeState(BILIBILI_ANONYMOUS_SESSION_KEY, JSON.stringify(s)),
         onThrottleUpdate: s => db.setRuntimeState(BILIBILI_THROTTLE_STATE_KEY, JSON.stringify(s)),
+        onHeavyWait: ms => log(`正常批量休息，还需 ${Math.ceil(ms / 1000)} 秒；不是 412/429 封禁`),
         ...extra,
       });
     };
@@ -592,13 +595,7 @@ async function runCourseFill({ partitionTargets = null, maxPages = null, provide
     if (blockedUntil > 0) db.deleteRuntimeState(BILIBILI_BLOCKED_UNTIL_KEY);
 
     runId = db.beginRun("course-fill", endTs);
-    const fillConfig = {
-      ...config,
-      requestDelayMinMs: Number(config.courseFillRequestDelayMinMs ?? config.requestDelayMinMs),
-      requestDelayMaxMs: Number(config.courseFillRequestDelayMaxMs ?? config.requestDelayMaxMs),
-      heavyKeywordRequestCount: Number(config.courseFillHeavyRequestCount ?? config.heavyKeywordRequestCount),
-      heavyKeywordCooldownMs: Number(config.courseFillHeavyCooldownMs ?? config.heavyKeywordCooldownMs),
-    };
+    const fillConfig = courseFillClientConfig(config);
     client = new BilibiliClient(fillConfig, {
       initialSession: parseRuntimeJson(db, BILIBILI_ANONYMOUS_SESSION_KEY),
       initialThrottleState: parseRuntimeJson(db, BILIBILI_THROTTLE_STATE_KEY),
@@ -812,6 +809,7 @@ async function doctor() {
   const anonymousSession = parseRuntimeJson(db, BILIBILI_ANONYMOUS_SESSION_KEY);
   const throttleState = parseRuntimeJson(db, BILIBILI_THROTTLE_STATE_KEY);
   const currentTs = nowSeconds();
+  const defaultTransportConfig = collectionProvider(config) === 'firecrawl' ? courseFillClientConfig(config) : config;
   const checks = {
     node: process.version,
     platform: `${process.platform} ${process.arch}`,
@@ -822,12 +820,12 @@ async function doctor() {
     firecrawl: await new FirecrawlClient({ evidenceDir: path.join(DATA_DIR, '.firecrawl') }).check()
       .catch(() => ({ cliAvailable: false, note: '请先安装 Firecrawl CLI 并登录；详见 README 首次使用' })),
     bilibiliTransport: {
-      searchApi: "WBI",
+      searchApi: collectionProvider(config) === 'firecrawl' ? 'Mobile Search → WBI' : 'WBI',
       cookieStorage: "anonymous-identifiers-in-local-sqlite; login-cookies-never",
-      requestIntervalMs: [config.requestDelayMinMs, config.requestDelayMaxMs],
+      requestIntervalMs: [defaultTransportConfig.requestDelayMinMs, defaultTransportConfig.requestDelayMaxMs],
       heavyCooldown: {
-        everyRequests: config.heavyKeywordRequestCount,
-        cooldownMs: config.heavyKeywordCooldownMs,
+        everyRequests: defaultTransportConfig.heavyKeywordRequestCount,
+        cooldownMs: defaultTransportConfig.heavyKeywordCooldownMs,
       },
       anonymousSessionReady: Boolean(
         anonymousSession?.cookies?.buvid3 && anonymousSession?.cookies?.buvid4
